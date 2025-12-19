@@ -1,6 +1,6 @@
-# HipKittens KernelBench Runner
+# HipGenerator
 
-Batch runner for generating and evaluating HipKittens/HIP kernels on **KernelBench (level1)** using an LLM.
+Generate and evaluate HipKittens/HIP kernels on **KernelBench (level1)** using an LLM.
 
 ## What’s in this repo
 
