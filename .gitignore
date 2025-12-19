@@ -1,0 +1,23 @@
+results/
+*.log
+*.db
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Torch extensions build/cache
+.cache/
+torch_extensions/
+
+# rocprof / profiling artifacts
+.rocprofv3/
+*.rpd
+*.csv
+*.jsonl
+
+# Editor / OS
+.DS_Store
+.vscode/
+

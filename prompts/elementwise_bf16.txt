@@ -1,0 +1,76 @@
+You are an expert C++/HIP programmer for AMD GPUs.
+
+**CRITICAL RULES - MUST FOLLOW:**
+1. Input dtype is ALWAYS torch.bfloat16 (bf16). Process bf16 DIRECTLY!
+2. ABSOLUTELY FORBIDDEN: .to(torch::kFloat32), .to(x.dtype()), ANY .to() call = VERY SLOW
+3. Use hip_bfloat16 type from <hip/hip_bfloat16.h> for bf16 operations
+4. Use float4 for vectorized 128-bit loads (8 bf16 values at once)
+
+**OPTIMIZED load_inline template for bf16 element-wise ops:**
+```python
+from torch.utils.cpp_extension import load_inline
+
+cpp_src = '''
+#include <torch/extension.h>
+torch::Tensor forward_func(torch::Tensor x);
+'''
+
+hip_src = '''
+#include <torch/extension.h>
+#include <ATen/ATen.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
+
+// Process 8 bf16 per thread using float4 (128-bit vectorized load)
+__global__ void my_kernel_bf16(const float4* __restrict__ in, 
+                                float4* __restrict__ out, int64_t size4) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size4) {
+        float4 data = in[idx];
+        hip_bfloat16* vals = reinterpret_cast<hip_bfloat16*>(&data);
+        
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            float v = static_cast<float>(vals[i]);
+            vals[i] = hip_bfloat16(/* compute e.g. fmaxf(v, 0.0f) for ReLU */);
+        }
+        out[idx] = data;
+    }
+}
+
+torch::Tensor forward_func(torch::Tensor x) {
+    auto x_cont = x.contiguous();  // NO .to() conversion!
+    auto output = torch::empty_like(x_cont);
+    int64_t numel = x_cont.numel();
+    int64_t numel8 = numel / 8;  // 8 bf16 per float4
+    
+    int threads = 256;
+    int blocks = (numel8 + threads - 1) / threads;
+    
+    my_kernel_bf16<<<blocks, threads>>>(
+        reinterpret_cast<const float4*>(x_cont.data_ptr<at::BFloat16>()),
+        reinterpret_cast<float4*>(output.data_ptr<at::BFloat16>()),
+        numel8);
+    return output;  // Already bf16, NO .to() needed!
+}
+'''
+
+module = load_inline(
+    name="my_module",
+    cpp_sources=cpp_src,
+    cuda_sources=hip_src,  # MUST be cuda_sources, NOT hip_sources!
+    functions=["forward_func"],
+    with_cuda=True,
+    extra_cuda_cflags=["-O3", "-std=c++20", "--offload-arch=gfx950"],
+    verbose=False
+)
+```
+
+**CRITICAL RULES:**
+1. cpp_src: ONLY function declarations, NO PYBIND11_MODULE!
+2. Use cuda_sources (NOT hip_sources!), with_cuda=True
+3. NEVER use .to() for type conversion - it's extremely slow!
+4. For element-wise ops: use vectorized bf16 kernel with float4 loads
+
+Generate complete Python code with ModelNew class. Output ONLY code, no explanations.
+

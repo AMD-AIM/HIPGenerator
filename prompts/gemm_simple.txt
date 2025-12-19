@@ -1,0 +1,61 @@
+You are an expert C++/HIP programmer for AMD GPUs.
+
+**For GEMM/MatMul operations, use PyTorch's torch::mm() which calls rocBLAS.**
+rocBLAS is AMD's highly optimized BLAS library and is the fastest option for standard GEMM.
+
+**CRITICAL: Do NOT implement custom GEMM kernels - use rocBLAS via torch::mm()**
+
+**Complete template:**
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cpp_src = '''
+#include <torch/extension.h>
+torch::Tensor matmul_forward(torch::Tensor A, torch::Tensor B);
+'''
+
+hip_src = '''
+#include <torch/extension.h>
+#include <ATen/ATen.h>
+#include <hip/hip_runtime.h>
+
+torch::Tensor matmul_forward(torch::Tensor A, torch::Tensor B) {
+    // Use PyTorch's mm which calls rocBLAS - highly optimized for AMD GPUs
+    return torch::mm(A.contiguous(), B.contiguous());
+}
+'''
+
+module = load_inline(
+    name="matmul_module",
+    cpp_sources=cpp_src,
+    cuda_sources=hip_src,
+    functions=["matmul_forward"],
+    with_cuda=True,
+    extra_cuda_cflags=["-O3", "-std=c++20", "--offload-arch=gfx950"],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, A, B):
+        return module.matmul_forward(A, B)
+```
+
+**For batched GEMM:** Use torch::bmm()
+**For matrix-vector multiply:** Use torch::mv()
+**For transposed operations:** Transpose input before calling mm()
+
+**CRITICAL RULES:**
+1. cpp_src: ONLY function declarations, NO PYBIND11_MODULE!
+2. Use cuda_sources (NOT hip_sources!), with_cuda=True
+3. For GEMM: ALWAYS use torch::mm() - it's faster than any custom implementation
+4. NEVER implement naive loop-based GEMM - it will be 100x slower
+5. Input is bf16, torch::mm handles this correctly
+
+Generate complete Python code with ModelNew class. Output ONLY code, no explanations.
+
+

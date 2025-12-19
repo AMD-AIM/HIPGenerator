@@ -1,0 +1,51 @@
+{
+  "description": "Prompt configuration for HipKittens kernel generation",
+  "default_prompt": "hipkittens_gemm_v3.txt",
+  "patterns": {
+    "matmul|matrix_mult|gemm|mm_|square.*matrix|standard.*matrix": "hipkittens_gemm_v3.txt",
+    "tall.*skinny|skinny|irregular|large_k|small_k": "hipkittens_gemm_v3.txt",
+    "bmm|batched.*matrix|3d.*matrix|4d.*matrix": "hipkittens_gemm_v3.txt",
+    "mv_|matvec|matrix_vector": "hipkittens_gemm_v3.txt",
+    "diagonal|symmetric|triangular|transposed": "hipkittens_general.txt",
+    "relu|sigmoid|tanh|gelu|selu|elu|softplus|softsign|leaky|hard": "elementwise_bf16.txt",
+    "softmax|logsoftmax": "elementwise_bf16.txt",
+    "layernorm|batchnorm|groupnorm|instancenorm|rmsnorm": "elementwise_bf16.txt",
+    "norm_|frobenius|l1norm|l2norm": "elementwise_bf16.txt",
+    "pool|max_|mean_|sum_|argmax|argmin|min_": "elementwise_bf16.txt",
+    "scalar": "elementwise_bf16.txt",
+    "attention": "hipkittens_general.txt"
+  },
+  "reflection_hints": {
+    "PERFORMANCE TOO SLOW": [
+      "Use the FULL scheduling optimizations from hipkittens_gemm_v3.txt",
+      "Main loop MUST use step=2 with 8 mma operations per iteration",
+      "Use asm volatile s_waitcnt vmcnt/lgkmcnt for precise memory ordering",
+      "Use __builtin_amdgcn_sched_barrier(0) to prevent instruction reordering",
+      "Use chiplet_transform_chunked for XCD locality"
+    ],
+    "HIGH LDS USAGE": [
+      "Current 256x64 tile uses ~156KB LDS, near the 160KB limit",
+      "This is expected for high-performance GEMM",
+      "Occupancy of 2 waves per CU is acceptable",
+      "Focus on scheduling optimizations instead of reducing tiles"
+    ],
+    "Compile error": [
+      "cpp_src must ONLY have declarations, NO PYBIND11_MODULE",
+      "Use bf16* (kittens type) for gl constructor, NOT hip_bfloat16*",
+      "Use hip/hip_runtime.h, NOT cuda_runtime.h",
+      "NUM_THREADS = kittens::WARP_THREADS * NUM_WARPS (WARP=64 on AMD)"
+    ],
+    "accuracy.*fail|max diff": [
+      "Check if B needs to be transposed for mma_ABt",
+      "mma_ABt expects: A[M,K] @ B^T[N,K], not A @ B",
+      "Ensure correct tile indexing and accumulator initialization",
+      "Add __builtin_amdgcn_s_barrier() after all loads before compute"
+    ],
+    "dimensions not aligned": [
+      "Pad M, N to multiples of 256 (BLOCK_SIZE)",
+      "Pad K to multiples of 64 (K_STEP)",
+      "Use prepare_B with pad_K, pad_N parameters",
+      "Extract original dimensions from padded result"
+    ]
+  }
+}
