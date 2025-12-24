@@ -27,7 +27,7 @@ Output: 128x256 per workgroup (2 M-blocks x 4 N-blocks x 32x32 per warp)
 #define NUM_THREADS ((NUM_PRODUCER_WORKERS + NUM_CONSUMER_WORKERS) * kittens::WARP_THREADS)
 
 int warp_id = kittens::warpid();
-int warp_group_id = kittens::warpgroupid();  // 0=producers, 1,2=consumers
+int warp_group_id = warpgroupid();  // 0=producers, 1,2=consumers
 bool is_producer = (warp_group_id == 0);
 bool is_consumer = (warp_group_id > 0 && warp_group_id <= M_BLOCK);
 int consumer_idx = is_consumer ? warp_group_id - 1 : 0;  // Which M-block
@@ -110,6 +110,9 @@ using ST_A = st_bf<HALF_BLOCK, K_STEP, st_16x32_s>;
 using ST_B = st_bf<HALF_BLOCK, K_STEP, st_16x32_s>;
 using G = kittens::group<NUM_PRODUCER_WORKERS>;
 
+// warpgroupid: 4 warps per group
+__device__ __forceinline__ int warpgroupid() { return threadIdx.x >> 8; }  // threadIdx.x / 256
+
 __global__ __launch_bounds__(NUM_THREADS, 2)
 void gemm_kernel_8c4p(const _gl g_A, const _gl g_Bt, _gl g_C, int M, int K, int N) {
     extern __shared__ alignment_dummy __shm[];
@@ -122,27 +125,13 @@ void gemm_kernel_8c4p(const _gl g_A, const _gl g_Bt, _gl g_C, int M, int K, int 
     // Register accumulators for consumers
     rt_fl<HALF_BLOCK, HALF_BLOCK, col_l, rt_16x16_s> c_accum[2][2];
     
-    // XCD-aware scheduling
-    int wgid = blockIdx.y * gridDim.x + blockIdx.x;
-    const int NUM_WGS = gridDim.x * gridDim.y;
-    wgid = chiplet_transform_chunked(wgid, NUM_WGS, NUM_XCDS, 16);
-    
-    // L2 swizzling
-    const int num_pid_m = M / OUTPUT_M;
-    const int num_pid_n = N / OUTPUT_N;
-    const int WGM = 4;
-    const int num_wgid_in_group = WGM * num_pid_n;
-    int group_id = wgid / num_wgid_in_group;
-    int first_pid_m = group_id * WGM;
-    int group_size_m = min(num_pid_m - first_pid_m, WGM);
-    int pid_m = first_pid_m + ((wgid % num_wgid_in_group) % group_size_m);
-    int pid_n = (wgid % num_wgid_in_group) / group_size_m;
-    int row = pid_m * M_BLOCK;
-    int col = pid_n * N_BLOCK;
+    // Simple block indexing (XCD scheduling removed for simplicity)
+    int row = blockIdx.y * M_BLOCK;
+    int col = blockIdx.x * N_BLOCK;
     
     // Warp identification
     int warp_id = kittens::warpid();
-    int warp_group_id = kittens::warpgroupid();
+    int warp_group_id = warpgroupid();
     bool is_producer = (warp_group_id == 0);
     bool is_consumer = (warp_group_id > 0 && warp_group_id <= M_BLOCK);
     int consumer_idx = is_consumer ? warp_group_id - 1 : 0;
