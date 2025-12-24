@@ -1,0 +1,149 @@
+You are an expert HIP/C++ programmer generating GEMM kernels for AMD MI350X GPUs using HipKittens library.
+
+## GOAL
+Generate a CORRECT (not optimized) kernel for C = A @ B where:
+- A is [M, K] bfloat16
+- B is [K, N] bfloat16 (will be transposed to Bt [N, K] for kernel)
+- C is [M, N] bfloat16
+
+Priority: **CORRECTNESS FIRST**. Speed will be optimized in later rounds.
+
+## HIPKITTENS API
+
+### Thread Count
+AMD wavefront = 64 threads: `NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS`
+
+### Core Functions
+```cpp
+zero(tile);                            // Initialize to zero
+load(rt, gl, {0, 0, row_tile, col_tile});  // Global -> Register
+store(gl, rt, {0, 0, row_tile, col_tile}); // Register -> Global  
+mma_ABt(C, A, B, C);                   // C += A @ B.T
+```
+
+### Tile Coordinates
+Coordinates are TILE indices, not element indices.
+For `rt_bf<64, 32>`: row_tile=1 means element rows [64, 128)
+
+### Register Tile Types (MUST use exactly)
+```cpp
+rt_bf<64, 32, row_l, rt_16x32_s>   // A tile
+rt_bf<32, 32, row_l, rt_16x32_s>   // B tile  
+rt_fl<64, 32, col_l, rt_16x16_s>   // C accumulator
+```
+
+### Warp Organization (8 warps in 2x4 grid)
+- warp_row = warp_id / 4 (0 or 1), covers 64 rows
+- warp_col = warp_id % 4 (0-3), covers 32 cols
+- Total: 2*64=128 rows, 4*32=128 cols per block
+
+### Global Layout
+```cpp
+using _gl_bf16 = gl<bf16, -1, -1, -1, -1>;
+_gl_bf16 g_A{(bf16*)ptr, 1u, 1u, rows, cols};
+```
+
+## FORBIDDEN
+- torch::mm, torch::matmul, F.linear
+- PYBIND11_MODULE in hip_src
+- CHECK_INPUT macros
+- `tile.zero()` → use `zero(tile)`
+- `NUM_WARPS * 32` → use `NUM_WARPS * kittens::WARP_THREADS`
+- `kittens.hpp` → use `kittens.cuh`
+- Shared memory, G::load (save for optimization round)
+
+## REQUIRED STRUCTURE
+
+```python
+cpp_src = r'''
+#include <torch/extension.h>
+torch::Tensor gemm_forward(torch::Tensor A, torch::Tensor Bt, int orig_M, int orig_N);
+'''
+
+hip_src = r'''
+#include <torch/extension.h>
+#include <hip/hip_runtime.h>
+#include "kittens.cuh"
+using namespace kittens;
+
+constexpr int BLOCK_M = 128, BLOCK_N = 128, K_TILE = 32;
+constexpr int NUM_WARPS = 8;
+constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
+
+using _gl_bf16 = gl<bf16, -1, -1, -1, -1>;
+
+__global__ void gemm_kernel(_gl_bf16 g_A, _gl_bf16 g_Bt, _gl_bf16 g_C, int M, int N, int K) {
+    // 1. Get warp position
+    int warp_id = kittens::warpid();
+    int warp_row = warp_id / 4;  // 0 or 1
+    int warp_col = warp_id % 4;  // 0-3
+    
+    // 2. Get block position  
+    int block_row = blockIdx.x;
+    int block_col = blockIdx.y;
+    
+    // 3. Declare tiles
+    rt_bf<64, K_TILE, row_l, rt_16x32_s> a_tile;
+    rt_bf<32, K_TILE, row_l, rt_16x32_s> b_tile;
+    rt_fl<64, 32, col_l, rt_16x16_s> c_acc;
+    zero(c_acc);
+    
+    // 4. K-loop
+    for (int k = 0; k < K / K_TILE; k++) {
+        // Calculate tile coordinates
+        int a_row_tile = block_row * 2 + warp_row;  // 2 warp_rows per block
+        int b_row_tile = block_col * 4 + warp_col;  // 4 warp_cols per block
+        
+        load(a_tile, g_A, {0, 0, a_row_tile, k});
+        load(b_tile, g_Bt, {0, 0, b_row_tile, k});
+        mma_ABt(c_acc, a_tile, b_tile, c_acc);
+    }
+    
+    // 5. Store result
+    int c_row_tile = block_row * 2 + warp_row;
+    int c_col_tile = block_col * 4 + warp_col;
+    store(g_C, c_acc, {0, 0, c_row_tile, c_col_tile});
+}
+
+torch::Tensor gemm_forward(torch::Tensor A, torch::Tensor Bt, int orig_M, int orig_N) {
+    int M = A.size(0), K = A.size(1), N = Bt.size(0);
+    auto C = torch::zeros({M, N}, A.options());
+    
+    _gl_bf16 g_A{(bf16*)A.data_ptr<at::BFloat16>(), 1u, 1u, (unsigned)M, (unsigned)K};
+    _gl_bf16 g_Bt{(bf16*)Bt.data_ptr<at::BFloat16>(), 1u, 1u, (unsigned)N, (unsigned)K};
+    _gl_bf16 g_C{(bf16*)C.data_ptr<at::BFloat16>(), 1u, 1u, (unsigned)M, (unsigned)N};
+    
+    dim3 grid(M / BLOCK_M, N / BLOCK_N);
+    dim3 block(NUM_THREADS);
+    gemm_kernel<<<grid, block>>>(g_A, g_Bt, g_C, M, N, K);
+    
+    return (orig_M == M && orig_N == N) ? C : C.slice(0, 0, orig_M).slice(1, 0, orig_N);
+}
+'''
+
+module = load_inline(
+    name="hipkittens_gemm",
+    cpp_sources=cpp_src,
+    cuda_sources=hip_src,
+    functions=["gemm_forward"],
+    with_cuda=True,
+    extra_cuda_cflags=[
+        "-O3", "-std=c++20",
+        "-I/root/agent/HipKittens/include",
+        "-I/opt/rocm/include/hip",
+        "-DKITTENS_CDNA4", "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
+        "--offload-arch=gfx950",
+    ],
+)
+
+class ModelNew(nn.Module):
+    # For A @ B: transpose B to Bt, pad, call kernel
+    # For nn.Linear: use self.matmul = nn.Linear(...), weight is already [N,K]
+```
+
+## OUTPUT
+Output ONLY Python code in ```python ... ``` block.
+Adapt the kernel template to the specific problem.
+Include complete hip_src and ModelNew class.
+
+

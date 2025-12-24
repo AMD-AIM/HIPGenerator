@@ -325,10 +325,19 @@ def evaluate(problem_path: str, code_path: str, run_profiler: bool = False) -> d
             ref_model = Model().cuda()
             new_model = ModelNew().cuda()
         
-        # Get appropriate dtype
-        ref_dtype = next(ref_model.parameters()).dtype if list(ref_model.parameters()) else torch.float32
-        ref_model = ref_model.to(ref_dtype)
-        new_model = new_model.to(ref_dtype)
+        # Get input dtype from get_inputs() to match model dtype
+        torch.manual_seed(12345)
+        sample_inputs = get_inputs()
+        input_dtype = None
+        for inp in sample_inputs:
+            if isinstance(inp, torch.Tensor) and inp.is_floating_point():
+                input_dtype = inp.dtype
+                break
+        
+        # Convert models to input dtype (critical for bf16/fp16 inputs)
+        if input_dtype is not None:
+            ref_model = ref_model.to(input_dtype)
+            new_model = new_model.to(input_dtype)
         
         # Copy weights from reference to new model (handle different naming conventions)
         ref_state = ref_model.state_dict()

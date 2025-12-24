@@ -1,129 +1,163 @@
 # HipGenerator
 
-Generate and evaluate HipKittens/HIP kernels on **KernelBench (level1)** using an LLM.
+Generate and evaluate HipKittens/HIP kernels on **KernelBench** using an LLM.
 
-## What’s in this repo
-
-| File | Purpose |
-|------|---------|
-| `generate.py` | Calls the LLM and generates Python code (with `load_inline`) for a KernelBench problem |
-| `eval.py` | Compiles/runs the generated code, checks correctness, benchmarks, and optionally runs `rocprofv3` |
-| `run_batch.sh` | Batch runner: loops over problems, retries with “reflection” prompts, and keeps best results |
-| `generate_report.py` | Generates a readable report from `results/summary.json` |
-| `monitor.sh` | Quick progress monitor for a running batch |
-
-## Environment variables
-
-- **`LLM_GATEWAY_KEY`**: **Required.** The LLM gateway API key (validated by `run_batch.sh`).
-- **`KERNELBENCH_DIR`**: Optional. Path to the KernelBench level1 directory. Default: `/root/agent/kernel-agent/datasets/KernelBench/level1`
-- **`NUM_SAMPLES`**: Optional. Number of parallel samples generated per attempt (default: `3`).
-
-## Usage
-
-### 1) Generate code for a single problem
+## Quick Start
 
 ```bash
-python3 generate.py \
-  --problem /path/to/problem.py \
-  --output output_code.py \
-  --prompt prompts/elementwise_bf16.txt \
-  --response-file llm_response.txt
+cd /root/HipGenerator
+
+# Set required environment variable
+export LLM_GATEWAY_KEY='your_key_here'
+
+# Test Level1 problems 1-10
+./run_batch.sh 1 10
+
+# Test Level2 specific problem
+./run_batch.sh --level2 --problem "76_Gemm_Add_ReLU"
+
+# Test all Level1 problems
+./run_batch.sh 1 40 --level1
 ```
 
-### 2) Evaluate a single generated file
+## Unified Test Entry: `run_batch.sh`
+
+**All testing should be done through `run_batch.sh`** - this is the single entry point for all tests.
+
+### Usage
 
 ```bash
-python3 eval.py \
-  --code output_code.py \
-  --problem /path/to/problem.py \
-  --output result.json
+./run_batch.sh [start_id] [end_id] [options]
+
+Options:
+  --level1         Test KernelBench level1 (default)
+  --level2         Test KernelBench level2
+  --problem NAME   Test specific problem by name
+  --help           Show help
 ```
 
-Exit codes:
-- `0`: success (accuracy pass + speedup >= 1.0)
-- `1`: partial (accuracy pass, speedup < 1.0)
-- `2`: failed (accuracy failed)
+### Environment Variables
 
-### 3) Batch run
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `LLM_GATEWAY_KEY` | **Yes** | - | API key for LLM gateway |
+| `NUM_SAMPLES` | No | 3 | Parallel samples per attempt |
+| `MAX_ATTEMPTS` | No | 3 | Max retry attempts |
+| `PYTORCH_ROCM_ARCH` | No | gfx950 | GPU architecture |
+| `DATASET_BASE` | No | /root/agent/kernel-agent/datasets/KernelBench | Dataset root |
+
+### Examples
 
 ```bash
+# Test Level1 problems 1-10 with 3 samples, 3 attempts
 export LLM_GATEWAY_KEY='...'
+./run_batch.sh 1 10
 
-# Override dataset location if needed
-export KERNELBENCH_DIR=/root/agent/kernel-agent/datasets/KernelBench/level1
+# Quick test with 1 sample, 1 attempt
+NUM_SAMPLES=1 MAX_ATTEMPTS=1 ./run_batch.sh --level2 --problem "76_Gemm"
 
-# Run a range (default is 1..40)
-./run_batch.sh 1 40
+# Full Level1 test
+./run_batch.sh 1 40 --level1
 
-# Run a smaller range
-./run_batch.sh 19 25
+# Test all Level2 GEMM problems
+./run_batch.sh --level2 --problem "Gemm"
 ```
 
-Each problem is tried up to 3 attempts. On failure/slow performance, the runner updates the prompt with error context (“reflection”).
-
-### 4) Monitor progress
-
-```bash
-./monitor.sh
-```
-
-### 5) Generate a report
-
-```bash
-python3 generate_report.py results/
-```
-
-## Results directory layout
+## Results
 
 ```
 results/
-├── summary.json           # overall summary (machine-readable)
-├── detailed_report.txt    # detailed report (text)
-├── detailed_report.json   # detailed report (json)
-├── batch_run.log          # run log
-└── <problem_name>/        # one directory per problem
-    ├── prompt_1.txt
-    ├── code_1.py
-    ├── result_1.json
-    ├── response_1.txt
-    ├── ...
-    ├── best_prompt.txt
-    ├── best_code.py
-    └── best_result.json
+├── summary.json            # Overall summary (JSON)
+├── detailed_report.txt     # Human-readable report
+├── detailed_report.json    # Detailed JSON report
+├── batch_run.log           # Execution log
+└── <problem_name>/         # Per-problem results
+    ├── code_1.py           # Generated code
+    ├── result_1.json       # Evaluation result
+    ├── best_code.py        # Best performing code
+    └── best_result.json    # Best result
 ```
 
-## Prompt configuration
+### Result Status
 
-Prompts are selected automatically via `prompts/config.json` based on the problem name (regex patterns).
+- **✓ Success**: Accuracy pass + speedup >= 1.0x
+- **⚠ Partial**: Accuracy pass + speedup < 1.0x
+- **✗ Failed**: Accuracy failed or compile error
 
-Directory:
+## Prompt Configuration
 
-```
-prompts/
-├── config.json
-├── elementwise_bf16.txt
-├── gemm_rocblas.txt
-└── gemm_hipkittens.txt
-```
-
-Example `config.json`:
+Prompts are auto-selected via `prompts/config.json`:
 
 ```json
 {
-  "default_prompt": "elementwise_bf16.txt",
+  "default_prompt": "hipkittens_gemm_v3.txt",
   "patterns": {
-    "relu|sigmoid|tanh": "elementwise_bf16.txt",
-    "matmul|gemm": "gemm_rocblas.txt",
-    "attention": "gemm_hipkittens.txt"
-  },
-  "reflection_hints": {
-    "PERFORMANCE TOO SLOW": ["hint1", "hint2"],
-    "Compile error": ["hint1", "hint2"]
+    "matmul|gemm": "hipkittens_gemm_v3.txt",
+    "relu|sigmoid": "elementwise_bf16.txt"
   }
 }
 ```
 
-## Notes / limitations
+### Key Prompts
 
-- GEMM via HipKittens MFMA APIs can be tricky to generate correctly; prompts/templates exist to guide the model.
-- For some workloads, **dtype conversions (`.to(...)`) can dominate runtime**; prompts try to steer away from them.
+| Prompt | Use Case |
+|--------|----------|
+| `hipkittens_gemm_v3.txt` | GEMM/Matmul (main, optimized) |
+| `elementwise_bf16.txt` | Element-wise ops (ReLU, etc.) |
+
+## Critical Rules (Enforced in Prompts)
+
+1. **禁止 PyTorch 矩阵乘法**: `torch.mm`, `torch.matmul`, `torch.bmm`, `F.linear` 全部禁止
+2. **nn.Linear 处理**: 使用 `weight.contiguous()` (不转置)，`mma_ABt(x, weight)` = x @ weight.T
+3. **BF16 转换**: 使用 `hip_bfloat16(float_val)` 和 `static_cast<float>(bf16_val)`
+
+## Project Structure
+
+```
+/root/HipGenerator/
+├── run_batch.sh          # ⭐ Unified test entry point
+├── generate.py           # LLM code generator
+├── eval.py               # Evaluator with profiling
+├── generate_report.py    # Report generator
+├── monitor.sh            # Progress monitor
+├── prompts/              # Prompt templates
+│   ├── config.json       # Auto-selection rules
+│   └── *.txt             # Prompt files
+├── docs/                 # Documentation
+└── results/              # Test outputs (gitignored)
+```
+
+## Monitoring Progress
+
+```bash
+# Watch live progress
+./monitor.sh
+
+# Or use tail
+tail -f results/batch_run.log
+```
+
+## Generating Reports
+
+Reports are auto-generated after `run_batch.sh` completes:
+
+```bash
+# Manual report generation
+python3 generate_report.py results/
+
+# View report
+cat results/detailed_report.txt
+```
+
+## Current Status (Dec 2025)
+
+- **Level2 Problem 76 (Gemm_Add_ReLU)**: Accuracy ✓, Speedup 0.83-0.85x
+- **Square matrices (4096², 8192²)**: 1.10x speedup verified
+- **Non-square matrices**: ~0.8-0.9x (optimization in progress)
+
+## Notes
+
+- GEMM kernels use HipKittens MFMA instructions (gfx950)
+- Always use `run_batch.sh` for consistent testing
+- Results are in `results/` (gitignored)
+- See `docs/GEMM_OPTIMIZATION_STATUS.md` for optimization details

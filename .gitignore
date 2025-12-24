@@ -1,11 +1,16 @@
+# Results and logs
 results/
 *.log
 *.db
+
+# Python cache
 __pycache__/
 **/__pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+*.pyc
+*.pyo
 
 # Torch extensions build/cache
 .cache/
@@ -20,4 +25,26 @@ torch_extensions/
 # Editor / OS
 .DS_Store
 .vscode/
+.idea/
+*.swp
+*.swo
+*~
 
+# Temporary/Development files
+demos/
+temp/
+tmp/
+scratch/
+*.tmp
+*.bak
+
+# Status/Summary files (generated)
+STATUS_SUMMARY.txt
+QUICKSTART.md
+FINAL_STATUS.md
+GEMM_FUSION_SUMMARY.md
+
+# Test outputs
+test_*.py
+output_*.py
+*.json.bak

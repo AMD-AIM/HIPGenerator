@@ -1,51 +1,57 @@
 {
-  "description": "Prompt configuration for HipKittens kernel generation",
-  "default_prompt": "hipkittens_gemm_v3.txt",
+  "description": "Prompt configuration for HipKittens kernel generation with adaptive tile sizes",
+  "default_prompt": "hipkittens_base.txt",
   "patterns": {
-    "matmul|matrix_mult|gemm|mm_|square.*matrix|standard.*matrix": "hipkittens_gemm_v3.txt",
-    "tall.*skinny|skinny|irregular|large_k|small_k": "hipkittens_gemm_v3.txt",
-    "bmm|batched.*matrix|3d.*matrix|4d.*matrix": "hipkittens_gemm_v3.txt",
-    "mv_|matvec|matrix_vector": "hipkittens_gemm_v3.txt",
-    "diagonal|symmetric|triangular|transposed": "hipkittens_general.txt",
-    "relu|sigmoid|tanh|gelu|selu|elu|softplus|softsign|leaky|hard": "elementwise_bf16.txt",
+    "matmul|matrix_mult|gemm|mm_|square.*matrix|standard.*matrix": "hipkittens_gemm.txt",
+    "tall.*skinny|skinny|irregular|large_k|small_k": "hipkittens_gemm.txt",
+    "bmm|batched.*matrix|3d.*matrix|4d.*matrix": "hipkittens_base.txt",
+    "mv_|matvec|matrix_vector": "hipkittens_gemm.txt",
+    "linear|fc|dense|mlp": "hipkittens_gemm.txt",
+    "gemm.*add|add.*relu|gemm.*relu|gemm.*bias|bias.*relu": "hipkittens_gemm.txt",
+    "relu|sigmoid|tanh|gelu|selu|elu|softplus|softsign|leaky|hard|silu|swish": "elementwise_bf16.txt",
     "softmax|logsoftmax": "elementwise_bf16.txt",
     "layernorm|batchnorm|groupnorm|instancenorm|rmsnorm": "elementwise_bf16.txt",
     "norm_|frobenius|l1norm|l2norm": "elementwise_bf16.txt",
-    "pool|max_|mean_|sum_|argmax|argmin|min_": "elementwise_bf16.txt",
-    "scalar": "elementwise_bf16.txt",
-    "attention": "hipkittens_general.txt"
+    "pool|max_|mean_|sum_|argmax|argmin|min_": "elementwise_bf16.txt"
   },
   "reflection_hints": {
     "PERFORMANCE TOO SLOW": [
-      "Use the FULL scheduling optimizations from hipkittens_gemm_v3.txt",
-      "Main loop MUST use step=2 with 8 mma operations per iteration",
-      "Use asm volatile s_waitcnt vmcnt/lgkmcnt for precise memory ordering",
-      "Use __builtin_amdgcn_sched_barrier(0) to prevent instruction reordering",
-      "Use chiplet_transform_chunked for XCD locality"
-    ],
-    "HIGH LDS USAGE": [
-      "Current 256x64 tile uses ~156KB LDS, near the 160KB limit",
-      "This is expected for high-performance GEMM",
-      "Occupancy of 2 waves per CU is acceptable",
-      "Focus on scheduling optimizations instead of reducing tiles"
+      "Check adaptive block size: 256x256 for min(M,N)>=512, else 128x128",
+      "Use shared memory with swizzled offsets and double buffering",
+      "Use __builtin_amdgcn_s_setprio(1/0) around mma operations"
     ],
     "Compile error": [
       "cpp_src must ONLY have declarations, NO PYBIND11_MODULE",
-      "Use bf16* (kittens type) for gl constructor, NOT hip_bfloat16*",
-      "Use hip/hip_runtime.h, NOT cuda_runtime.h",
-      "NUM_THREADS = kittens::WARP_THREADS * NUM_WARPS (WARP=64 on AMD)"
+      "Use extern __shared__ with shared_allocator, NOT static __shared__",
+      "Use hipFuncSetAttribute((void*)kernel, ...) for dynamic shared memory"
     ],
     "accuracy.*fail|max diff": [
-      "Check if B needs to be transposed for mma_ABt",
-      "mma_ABt expects: A[M,K] @ B^T[N,K], not A @ B",
-      "Ensure correct tile indexing and accumulator initialization",
-      "Add __builtin_amdgcn_s_barrier() after all loads before compute"
+      "CRITICAL: Use s_waitcnt vmcnt(0) after G::load",
+      "CRITICAL: Use s_waitcnt lgkmcnt(0) after shared->register load",
+      "Use subtile_inplace to extract per-warp data from shared tiles"
     ],
     "dimensions not aligned": [
-      "Pad M, N to multiples of 256 (BLOCK_SIZE)",
-      "Pad K to multiples of 64 (K_STEP)",
-      "Use prepare_B with pad_K, pad_N parameters",
-      "Extract original dimensions from padded result"
+      "Pad M, N to block size (128 or 256), K to 64",
+      "Use slice to extract original dimensions from result"
+    ],
+    "torch.mm|torch.matmul": [
+      "FORBIDDEN! Never use PyTorch GEMM APIs",
+      "Use custom HipKittens kernel instead"
     ]
+  },
+  "block_size_selection": {
+    "description": "Adaptive block size based on matrix dimensions",
+    "large_threshold": 512,
+    "large_config": {
+      "BLOCK_SIZE": 256,
+      "warps": "2x4=8",
+      "note": "Each warp computes 2x2 tiles of 64x32"
+    },
+    "small_config": {
+      "BLOCK_SIZE": 128,
+      "warps": "2x4=8", 
+      "note": "Each warp computes 1 tile of 32x16"
+    },
+    "K_STEP": 64
   }
 }
