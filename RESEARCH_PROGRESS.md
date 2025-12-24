@@ -61,23 +61,42 @@ __device__ __forceinline__ int warpgroupid() { return threadIdx.x >> 8; }
   - Extra synchronization overhead
   - Idle producer warps during compute phases
 
+## Adaptive Optimization
+
+Created unified adaptive prompt (`hipkittens_gemm_adaptive.txt`) that:
+- Explains multiple optimization strategies
+- Lets LLM choose based on matrix dimensions
+- Provides concrete kernel templates
+
+## Challenges Identified
+
+1. **Fine-grained Interleave Complexity**: The reference kernel uses very precise scheduling:
+   - Step 2 k-tiles per iteration
+   - Interleaved load/compute within each step
+   - Precise lgkmcnt(8)/vmcnt(6) values
+   - This is hard for LLM to generate correctly without a very detailed template
+
+2. **Producer-Consumer Overhead**: 12 warps (4 producer + 8 consumer) adds overhead that only pays off on very large matrices or fused kernels
+
+3. **warpgroupid Missing**: HipKittens doesn't define `kittens::warpgroupid()`, requiring custom implementation
+
 ## Next Steps
 
-1. **Tune 8c4p for Larger Matrices**: Producer-consumer may show benefits on larger problems
-2. **Adaptive Selection**: Use Level 1 for small matrices, Level 3 for large fused kernels
-3. **Interleave Pattern**: Implement 4-wave interleave within 8c4p for better overlap
-4. **XCD Scheduling**: Carefully integrate XCD scheduling when needed
+1. **Large Matrix Testing**: Test all strategies on 8192x8192 or larger to see where 8c4p wins
+2. **Fused Kernel Testing**: Test producer-consumer on GEMM+activation to see overlap benefits
+3. **Interleave Template**: Create a more detailed interleave template if needed for >0.9x
 
 ## Files
 
 ```
 prompts/
-├── hipkittens_gemm.txt       # Base prompt
-├── hipkittens_gemm_opt1.txt  # Level 1 (same as base)
-├── hipkittens_gemm_opt2.txt  # Level 2 (deeper pipeline)
-├── hipkittens_gemm_opt3.txt  # Level 3 (8c4p producer-consumer)
-└── config.json               # Pattern matching config
+├── hipkittens_gemm.txt          # Base prompt
+├── hipkittens_gemm_opt1.txt     # Level 1 (same as base)
+├── hipkittens_gemm_opt2.txt     # Level 2 (deeper pipeline)
+├── hipkittens_gemm_opt3.txt     # Level 3 (8c4p producer-consumer)
+├── hipkittens_gemm_adaptive.txt # Unified adaptive prompt
+└── config.json                  # Pattern matching config
 
-optimize_iterative.py         # Framework script
+optimize_iterative.py            # Framework script
 ```
 
