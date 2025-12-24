@@ -1,0 +1,32 @@
+{
+  "problem": "1_Square_matrix_multiplication_",
+  "code_path": "results_triton/1_Square_matrix_multiplication_/code_3.py",
+  "backend": "triton",
+  "compile_success": true,
+  "accuracy_pass": true,
+  "max_diff": 0.0,
+  "mean_diff": 0.0,
+  "has_nan": false,
+  "has_inf": false,
+  "ref_time_ms": 0.11654498055577278,
+  "new_time_ms": 0.3108198498375714,
+  "speedup": 0.3749599023893648,
+  "perf_analysis": "Kernel: matmul_kernel | Avg: 589.6us | GPU%: 95.0% | LDS: 128.0KB | Block: 512x1x1 | Hints: HIGH LDS USAGE (128.0KB): May limit occupancy, consider smaller tiles; HIGH VARIANCE (min=305.2us, max=1193.1us): Possible load imbalance",
+  "error": null,
+  "rocprof_metrics": {
+    "kernel_name": "matmul_kernel",
+    "duration_ms": 642.060108,
+    "l2_cache_hit_rate": 0,
+    "mfma_utilization_pct": 0,
+    "optimization_hints": [
+      "HIGH LDS USAGE (128.0KB): May limit occupancy, consider smaller tiles",
+      "HIGH VARIANCE (min=305.2us, max=1193.1us): Possible load imbalance"
+    ],
+    "raw_metrics": {
+      "min_us": 305.168,
+      "max_us": 1193.071,
+      "stddev_us": 280.8962218167371,
+      "lds_kb": 128.0
+    }
+  }
+}

@@ -5,19 +5,19 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        # AMD MI300X/MI350X optimized configs - BLOCK_K=128 for MFMA
+        # AMD MI300X optimized configs - BLOCK_K=128 crucial for MFMA
         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=8),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=8),
         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=8),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 4}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
     ],
     key=['M', 'N', 'K'],
 )
 @triton.jit
-def matmul_kernel(
-    a_ptr, b_ptr, c_ptr,
+def matmul_bias_relu_kernel(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
     M, N, K,
     stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
@@ -27,7 +27,7 @@ def matmul_kernel(
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
     
-    # Swizzled tile ordering for better L2 cache utilization
+    # Swizzled tile ordering for L2 cache
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
@@ -52,7 +52,14 @@ def matmul_kernel(
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
     
-    c = accumulator.to(tl.bfloat16)
+    # Load bias
+    bias_ptrs = bias_ptr + offs_bn
+    bias = tl.load(bias_ptrs, mask=offs_bn < N, other=0.0)
+    
+    # Add bias and apply ReLU
+    accumulator = accumulator + bias[None, :].to(tl.float32)
+    c = tl.maximum(accumulator, 0.0).to(tl.bfloat16)
+    
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
@@ -62,38 +69,38 @@ def matmul_kernel(
 
 class ModelNew(nn.Module):
     """
-    Optimized model using Triton kernel for matrix multiplication
+    Optimized model using Triton kernel for fused GEMM + bias + ReLU.
     """
-    def __init__(self):
+    def __init__(self, in_features, out_features, bias_shape):
         super(ModelNew, self).__init__()
-    
-    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-        """
-        Performs matrix multiplication using Triton kernel.
+        self.weight = nn.Parameter(torch.randn(out_features, in_features, dtype=torch.bfloat16))
+        self.bias = nn.Parameter(torch.randn(bias_shape, dtype=torch.bfloat16))
+        self.in_features = in_features
+        self.out_features = out_features
 
+    def forward(self, x):
+        """
         Args:
-            A (torch.Tensor): Input matrix A of shape (N, N).
-            B (torch.Tensor): Input matrix B of shape (N, N).
-
+            x (torch.Tensor): Input tensor with shape (batch_size, in_features).
         Returns:
-            torch.Tensor: Output matrix C of shape (N, N).
+            torch.Tensor: Output tensor with shape (batch_size, out_features).
         """
-        assert A.shape[1] == B.shape[0], "Incompatible dimensions"
-        M, K = A.shape
-        K, N = B.shape
-        
-        # Ensure inputs are contiguous and in bfloat16
-        A = A.contiguous()
-        B = B.contiguous()
+        assert x.shape[1] == self.in_features, "Input dimension mismatch"
+        M, K = x.shape
+        N = self.out_features
         
         # Allocate output tensor
-        C = torch.empty((M, N), device=A.device, dtype=A.dtype)
+        output = torch.empty((M, N), device=x.device, dtype=x.dtype)
         
         # Launch kernel
         grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),)
-        matmul_kernel[grid](
-            A, B, C, M, N, K,
-            A.stride(0), A.stride(1), B.stride(0), B.stride(1), C.stride(0), C.stride(1),
+        
+        matmul_bias_relu_kernel[grid](
+            x, self.weight, self.bias, output,
+            M, N, K,
+            x.stride(0), x.stride(1),
+            self.weight.stride(0), self.weight.stride(1),
+            output.stride(0), output.stride(1),
         )
         
-        return C
+        return output

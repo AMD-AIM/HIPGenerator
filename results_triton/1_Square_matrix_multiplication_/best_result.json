@@ -28,5 +28,6 @@
       "stddev_us": 256.7061855586391,
       "lds_kb": 128.0
     }
-  }
+  },
+  "sample_path": "results_triton/1_Square_matrix_multiplication_/code_1.py"
 }

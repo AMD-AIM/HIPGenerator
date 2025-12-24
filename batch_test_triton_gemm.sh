@@ -1,12 +1,18 @@
 #!/bin/bash
 # Batch test script for Triton GEMM kernel generation
 # Tests all GEMM-related problems from KernelBench Level1 and Level2
+#
+# NOTE: On AMD GPUs, rocBLAS is highly optimized. Triton typically achieves
+# 50-70% of rocBLAS performance for large GEMMs. Target speedup is set to 0.5x
+# which is a realistic goal for Triton on AMD.
 
 export PYTORCH_ROCM_ARCH=gfx950
 
 # Check for backend argument (default: triton)
 BACKEND="${1:-triton}"
+TARGET_SPEEDUP="${2:-0.5}"
 echo "Testing with backend: $BACKEND"
+echo "Target speedup: ${TARGET_SPEEDUP}x"
 
 problems=(
     # Level 1 - Basic GEMM
@@ -42,7 +48,7 @@ for problem in "${problems[@]}"; do
     echo -e "\n--- Testing: $name ---"
     
     # Run single attempt with specified backend
-    result=$(python run_loop.py --problem "$problem" --max-attempts 1 --backend "$BACKEND" --output "$OUTPUT_DIR" 2>&1)
+    result=$(python run_loop.py --problem "$problem" --max-attempts 3 --backend "$BACKEND" --output "$OUTPUT_DIR" --target-speedup "$TARGET_SPEEDUP" 2>&1)
     
     # Extract status
     if echo "$result" | grep -q "Accuracy: PASS"; then

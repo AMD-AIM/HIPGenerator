@@ -484,19 +484,33 @@ def call_llm(system_prompt: str, user_prompt: str, temperature: float = 0.7) -> 
 
 
 def generate_samples(system_prompt: str, user_prompt: str, num_samples: int = 3, 
-                     temperature: float = 0.7) -> list:
+                     temperature: float = 0.7, backend: str = "hip") -> list:
     """Generate multiple code samples in parallel using threading."""
     import concurrent.futures
     
     samples = []
     
+    # Strategy hints for Triton backend to increase diversity
+    triton_strategy_hints = [
+        "\n\n**IMPORTANT: For this sample, use Strategy 1 (Split-K) or Strategy 4 (Large 256x256 Tiles).**",
+        "\n\n**IMPORTANT: For this sample, use different autotune configs with BLOCK_K=128 for AMD MFMA.**",
+        "\n\n**IMPORTANT: For this sample, try unique tile sizes like 256x64 or 64x256 with high num_stages.**",
+    ]
+    
     def generate_one(sample_id):
         """Generate a single sample."""
-        # Slightly vary temperature for diversity (small variation for low temp)
-        temp = temperature + (sample_id - 1) * 0.05  # 0.1, 0.15, 0.2 for 3 samples
-        temp = min(temp, 0.5)  # Cap at 0.5 to keep output focused
+        # Larger temperature variation for diversity
+        temp = temperature + (sample_id - 1) * 0.15  # e.g., 0.3, 0.45, 0.6 for 3 samples
+        temp = min(temp, 0.8)  # Allow higher temperature for more diversity
+        
+        # Add strategy hint for Triton to force different approaches
+        if backend == "triton" and sample_id <= len(triton_strategy_hints):
+            modified_prompt = user_prompt + triton_strategy_hints[sample_id - 1]
+        else:
+            modified_prompt = user_prompt
+        
         try:
-            response = call_llm(system_prompt, user_prompt, temperature=temp)
+            response = call_llm(system_prompt, modified_prompt, temperature=temp)
             code = extract_code(response)
             return {"id": sample_id, "response": response, "code": code, "error": None}
         except Exception as e:
@@ -581,10 +595,11 @@ def main():
     
     # Generate samples
     if args.num_samples > 1:
-        print(f"Generating {args.num_samples} samples in parallel (temp={args.temperature})...")
+        print(f"Generating {args.num_samples} samples in parallel (temp={args.temperature}, backend={args.backend})...")
         samples = generate_samples(system_prompt, user_prompt, 
                                    num_samples=args.num_samples, 
-                                   temperature=args.temperature)
+                                   temperature=args.temperature,
+                                   backend=args.backend)
         
         # Save all samples
         output_base = args.output.rsplit('.', 1)[0]  # Remove .py extension

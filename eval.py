@@ -96,7 +96,7 @@ def benchmark(fn, warmup=10, iterations=100):
     return (end - start) / iterations * 1000  # ms
 
 
-def run_rocprof_analysis(code_path: str, problem_path: str) -> dict:
+def run_rocprof_analysis(code_path: str, problem_path: str, backend: str = "hip") -> dict:
     """Run rocprofv3 to get detailed kernel performance metrics for GEMM optimization."""
     perf_info = {
         "kernel_name": None,
@@ -121,9 +121,46 @@ def run_rocprof_analysis(code_path: str, problem_path: str) -> dict:
     try:
         import sqlite3
         
-        # Create profiling script
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-            f.write(f'''
+        # Create profiling script - use importlib for Triton
+        if backend == "triton":
+            profile_code = f'''
+import os
+import sys
+os.environ["PYTORCH_ROCM_ARCH"] = "gfx950"
+import torch
+import torch.nn as nn
+import importlib.util
+
+# Load problem
+exec(open("{problem_path}").read())
+
+# Load Triton code via importlib (required for @triton.jit)
+spec = importlib.util.spec_from_file_location("triton_module", "{code_path}")
+triton_module = importlib.util.module_from_spec(spec)
+sys.modules["triton_module"] = triton_module
+spec.loader.exec_module(triton_module)
+ModelNew = triton_module.ModelNew
+
+torch.manual_seed(42)
+init_inputs = get_init_inputs() if 'get_init_inputs' in dir() else []
+model = ModelNew(*init_inputs).cuda() if init_inputs else ModelNew().cuda()
+
+inputs = get_inputs()
+inputs = [x.cuda() if isinstance(x, torch.Tensor) else x for x in inputs]
+
+# Warmup and profile
+with torch.no_grad():
+    for _ in range(5):
+        _ = model(*inputs)
+    torch.cuda.synchronize()
+    
+    # Profile runs
+    for _ in range(20):
+        _ = model(*inputs)
+    torch.cuda.synchronize()
+'''
+        else:
+            profile_code = f'''
 import os
 os.environ["PYTORCH_ROCM_ARCH"] = "gfx950"
 import torch
@@ -143,7 +180,10 @@ with torch.no_grad():
     for _ in range(10):
         _ = model(*inputs)
     torch.cuda.synchronize()
-''')
+'''
+        
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            f.write(profile_code)
             profile_script = f.name
         
         # Output database path
@@ -178,13 +218,17 @@ with torch.no_grad():
                 cursor.execute("SELECT * FROM kernel_summary")
                 rows = cursor.fetchall()
                 
-                pytorch_internal = ['elementwise', 'at::native', 'c10::', 'vectorized', 'copy']
+                # Skip PyTorch internal kernels
+                pytorch_internal = ['elementwise', 'at::native', 'c10::', 'vectorized', 'copy', 'fill_', 'zero_']
+                # Look for our kernel (Triton kernels often have 'matmul', 'kernel', or the function name)
+                target_patterns = ['matmul', 'gemm', 'mfma', 'kernel', 'triton']
                 
                 for row in rows:
                     kernel_name = row[0] if row else ""
                     is_internal = any(pat in kernel_name for pat in pytorch_internal)
+                    is_target = any(pat in kernel_name.lower() for pat in target_patterns)
                     
-                    if not is_internal and ('gemm' in kernel_name.lower() or 'mfma' in kernel_name.lower() or 'kernel' in kernel_name.lower()):
+                    if not is_internal and is_target:
                         # kernel_summary columns: name, calls, DURATION(nsec), SQR(nsec), AVERAGE(nsec), PERCENT, MIN(nsec), MAX(nsec), VARIANCE, STD_DEV
                         # Note: All time units are nanoseconds!
                         perf_info["kernel_name"] = kernel_name[:100]
@@ -472,7 +516,7 @@ def evaluate(problem_path: str, code_path: str, run_profiler: bool = False, back
             if run_profiler:
                 print("Running rocprof analysis...")
                 try:
-                    perf_info = run_rocprof_analysis(code_path, problem_path)
+                    perf_info = run_rocprof_analysis(code_path, problem_path, backend=backend)
                     result["perf_analysis"] = perf_info.get("analysis", "")
                     # Store detailed metrics for optimization
                     result["rocprof_metrics"] = {

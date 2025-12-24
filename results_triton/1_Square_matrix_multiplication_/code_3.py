@@ -5,13 +5,15 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        # AMD MI300X/MI350X optimized configs - BLOCK_K=128 for MFMA
+        # Large tiles with BLOCK_K=128 for AMD MFMA
         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=8),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=8),
         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=8),
+        # Extra large tile config
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 2}, num_stages=2, num_warps=8),
+        # Balanced configs
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 4}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
     ],
     key=['M', 'N', 'K'],
 )
@@ -35,24 +37,39 @@ def matmul_kernel(
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
     
-    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
-    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    # Compute offsets with boundary handling
+    offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
     
+    # Initialize pointers
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
     
+    # Initialize accumulator
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     
+    # Main K-loop with vectorized loads
     for k in range(0, tl.cdiv(K, BLOCK_K)):
-        k_remaining = K - k * BLOCK_K
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
+        # Create masks for boundary conditions
+        a_mask = (offs_am[:, None] < M) & (offs_k[None, :] + k * BLOCK_K < K)
+        b_mask = (offs_k[:, None] + k * BLOCK_K < K) & (offs_bn[None, :] < N)
+        
+        # Load tiles with masking
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        
+        # Matrix multiplication using tl.dot
         accumulator = tl.dot(a, b, accumulator)
+        
+        # Advance pointers
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
     
+    # Convert to output dtype
     c = accumulator.to(tl.bfloat16)
+    
+    # Store output with masking
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
@@ -69,7 +86,7 @@ class ModelNew(nn.Module):
     
     def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         """
-        Performs matrix multiplication using Triton kernel.
+        Performs matrix multiplication using optimized Triton kernel.
 
         Args:
             A (torch.Tensor): Input matrix A of shape (N, N).
@@ -82,18 +99,17 @@ class ModelNew(nn.Module):
         M, K = A.shape
         K, N = B.shape
         
-        # Ensure inputs are contiguous and in bfloat16
-        A = A.contiguous()
-        B = B.contiguous()
-        
         # Allocate output tensor
         C = torch.empty((M, N), device=A.device, dtype=A.dtype)
         
-        # Launch kernel
+        # Launch kernel with grid
         grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),)
+        
         matmul_kernel[grid](
             A, B, C, M, N, K,
-            A.stride(0), A.stride(1), B.stride(0), B.stride(1), C.stride(0), C.stride(1),
+            A.stride(0), A.stride(1), 
+            B.stride(0), B.stride(1), 
+            C.stride(0), C.stride(1),
         )
         
         return C
