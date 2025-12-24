@@ -1,6 +1,9 @@
 {
-  "description": "Prompt configuration for HipKittens kernel generation with adaptive tile sizes",
+  "description": "Prompt configuration for HipKittens/Triton kernel generation with adaptive tile sizes",
+  
   "default_prompt": "hipkittens_base.txt",
+  "triton_default_prompt": "triton_base.txt",
+  
   "patterns": {
     "matmul|matrix_mult|gemm|mm_|square.*matrix|standard.*matrix": "hipkittens_gemm.txt",
     "tall.*skinny|skinny|irregular|large_k|small_k": "hipkittens_gemm.txt",
@@ -14,6 +17,22 @@
     "norm_|frobenius|l1norm|l2norm": "elementwise_bf16.txt",
     "pool|max_|mean_|sum_|argmax|argmin|min_": "elementwise_bf16.txt"
   },
+  
+  "triton_patterns": {
+    "matmul|matrix_mult|gemm|mm_|square.*matrix|standard.*matrix": "triton_gemm.txt",
+    "tall.*skinny|skinny|irregular|large_k|small_k": "triton_gemm.txt",
+    "bmm|batched.*matrix|3d.*matrix|4d.*matrix": "triton_gemm.txt",
+    "mv_|matvec|matrix_vector": "triton_gemm.txt",
+    "linear|fc|dense|mlp": "triton_gemm.txt",
+    "gemm.*add|add.*relu|gemm.*relu|gemm.*bias|bias.*relu": "triton_gemm.txt",
+    "relu|sigmoid|tanh|gelu|selu|elu|softplus|softsign|leaky|hard|silu|swish|mish|divide": "triton_gemm.txt",
+    "softmax|logsoftmax": "triton_base.txt",
+    "layernorm|batchnorm|groupnorm|instancenorm|rmsnorm": "triton_base.txt",
+    "norm_|frobenius|l1norm|l2norm": "triton_base.txt",
+    "pool|max_|mean_|sum_|argmax|argmin|min_": "triton_base.txt",
+    "scaling|residual|add": "triton_gemm.txt"
+  },
+  
   "reflection_hints": {
     "PERFORMANCE TOO SLOW": [
       "Check adaptive block size: 256x256 for min(M,N)>=512, else 128x128",
@@ -36,9 +55,28 @@
     ],
     "torch.mm|torch.matmul": [
       "FORBIDDEN! Never use PyTorch GEMM APIs",
-      "Use custom HipKittens kernel instead"
+      "Use custom HipKittens/Triton kernel instead"
     ]
   },
+  
+  "triton_reflection_hints": {
+    "PERFORMANCE TOO SLOW": [
+      "Add more autotune configs for different block sizes",
+      "Increase num_stages for better software pipelining",
+      "Try larger num_warps (4-8) for AMD GPUs"
+    ],
+    "Compile error": [
+      "Check Triton kernel signature matches call site",
+      "Ensure tl.constexpr parameters are passed correctly",
+      "Use proper Triton dtypes: tl.bfloat16, tl.float32"
+    ],
+    "accuracy.*fail|max diff": [
+      "Use float32 accumulator for better precision",
+      "Check mask logic for boundary handling",
+      "Verify stride calculations for non-contiguous tensors"
+    ]
+  },
+  
   "block_size_selection": {
     "description": "Adaptive block size based on matrix dimensions",
     "large_threshold": 512,
@@ -53,5 +91,15 @@
       "note": "Each warp computes 1 tile of 32x16"
     },
     "K_STEP": 64
+  },
+  
+  "triton_autotune_configs": {
+    "description": "Common Triton autotune configurations for AMD GPUs",
+    "gemm_configs": [
+      {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8, "num_stages": 3, "num_warps": 8},
+      {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 8, "num_stages": 4, "num_warps": 4},
+      {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_SIZE_M": 8, "num_stages": 4, "num_warps": 4},
+      {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8, "num_stages": 3, "num_warps": 8}
+    ]
   }
 }

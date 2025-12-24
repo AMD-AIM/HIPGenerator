@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Generate HipKittens kernel code from a KernelBench problem using LLM.
-Usage: python generate.py --problem <problem_path> --output <output_path> [--prompt <prompt_file>]
+Generate HipKittens/Triton kernel code from a KernelBench problem using LLM.
+Usage: python generate.py --problem <problem_path> --output <output_path> [--prompt <prompt_file>] [--backend hip|triton]
 """
 import os
 import sys
@@ -14,6 +14,9 @@ from pathlib import Path
 os.environ["PYTORCH_ROCM_ARCH"] = "gfx950"
 
 from anthropic import Anthropic
+
+# Supported backends
+BACKENDS = ["hip", "triton"]
 
 
 def classify_problem(problem_name: str, problem_code: str) -> str:
@@ -60,14 +63,20 @@ def get_template(problem_type: str) -> str:
     return None
 
 
-def load_prompt(prompt_file: str, problem_name: str = None) -> str:
-    """Load system prompt from file, config, or use default."""
+def load_prompt(prompt_file: str, problem_name: str = None, backend: str = "hip") -> str:
+    """Load system prompt from file, config, or use default.
+    
+    Args:
+        prompt_file: Explicit prompt file path (overrides config)
+        problem_name: Problem name for config-based selection
+        backend: Backend type ('hip' or 'triton')
+    """
     # If explicit prompt file provided, use it
     if prompt_file and os.path.exists(prompt_file):
         with open(prompt_file) as f:
             return f.read()
     
-    # Try to load from config based on problem name
+    # Try to load from config based on problem name and backend
     script_dir = Path(__file__).parent
     config_path = script_dir / "prompts" / "config.json"
     
@@ -77,7 +86,18 @@ def load_prompt(prompt_file: str, problem_name: str = None) -> str:
             config = json.load(f)
         
         problem_lower = problem_name.lower()
-        for pattern, prompt_filename in config.get("patterns", {}).items():
+        
+        # For Triton backend, use triton-specific patterns
+        if backend == "triton":
+            patterns_key = "triton_patterns"
+            default_key = "triton_default_prompt"
+        else:
+            patterns_key = "patterns"
+            default_key = "default_prompt"
+        
+        patterns = config.get(patterns_key, config.get("patterns", {}))
+        
+        for pattern, prompt_filename in patterns.items():
             if re.search(pattern, problem_lower, re.IGNORECASE):
                 prompt_path = script_dir / "prompts" / prompt_filename
                 if prompt_path.exists():
@@ -85,16 +105,111 @@ def load_prompt(prompt_file: str, problem_name: str = None) -> str:
                         return f.read()
         
         # Use default from config
-        default_prompt = config.get("default_prompt", "elementwise_bf16.txt")
+        if backend == "triton":
+            default_prompt = config.get(default_key, "triton_base.txt")
+        else:
+            default_prompt = config.get(default_key, "elementwise_bf16.txt")
+        
         default_path = script_dir / "prompts" / default_prompt
         if default_path.exists():
             with open(default_path) as f:
                 return f.read()
     
-    return get_default_prompt()
+    return get_default_prompt(backend)
 
 
-def get_default_prompt() -> str:
+def get_default_prompt(backend: str = "hip") -> str:
+    """Default system prompt based on backend."""
+    if backend == "triton":
+        return get_default_triton_prompt()
+    return get_default_hip_prompt()
+
+
+def get_default_triton_prompt() -> str:
+    """Default Triton system prompt."""
+    return '''You are an expert Triton programmer for AMD GPUs.
+
+**CRITICAL RULES - MUST FOLLOW:**
+1. ALL computation MUST be in Triton kernels using @triton.jit
+2. ABSOLUTELY FORBIDDEN: torch.mm(), torch.matmul(), torch.bmm() for the main computation
+3. Input dtype is torch.bfloat16 (bf16). Process bf16 directly using tl.bfloat16
+4. PyTorch ONLY for: torch.empty(), .data_ptr(), .contiguous()
+5. For GEMM: MUST use tl.dot() which maps to AMD MFMA instructions
+
+**Triton GEMM template:**
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    
+    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_k = tl.arange(0, BLOCK_K)
+    
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_K, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_K, other=0.0)
+        accumulator = tl.dot(a, b, accumulator)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+    
+    c = accumulator.to(tl.bfloat16)
+    offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+def matmul(a, b):
+    M, K = a.shape
+    K, N = b.shape
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']), )
+    matmul_kernel[grid](a, b, c, M, N, K,
+                        a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1))
+    return c
+```
+
+Generate complete Python code with ModelNew class using Triton kernels.
+
+**OUTPUT FORMAT:**
+- Output ONLY the Python code inside ```python ... ``` block
+- NO explanations, NO comments before or after the code block
+- Start directly with ```python and end with ```
+'''
+
+
+def get_default_hip_prompt() -> str:
     """Default HipKittens system prompt."""
     return '''You are an expert C++/HIP programmer for AMD GPUs using HipKittens library.
 
@@ -322,9 +437,21 @@ def load_problem(problem_path: str) -> dict:
     }
 
 
-def build_user_prompt(problem: dict) -> str:
+def build_user_prompt(problem: dict, backend: str = "hip") -> str:
     """Build user prompt from problem."""
-    return f'''**PyTorch Reference Implementation:**
+    if backend == "triton":
+        return f'''**PyTorch Reference Implementation:**
+```python
+{problem["code"]}
+```
+
+Generate complete Python code implementing ModelNew with Triton kernels.
+Include: Triton kernel(s) with @triton.autotune, ModelNew class.
+The ModelNew.forward() must produce same output as Model.forward().
+Use tl.dot() for matrix multiplications, NOT torch.mm/matmul.
+'''
+    else:
+        return f'''**PyTorch Reference Implementation:**
 ```python
 {problem["code"]}
 ```
@@ -416,7 +543,7 @@ def extract_code(response: str) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate HipKittens kernel from KernelBench problem")
+    parser = argparse.ArgumentParser(description="Generate HipKittens/Triton kernel from KernelBench problem")
     parser.add_argument("--problem", required=True, help="Path to KernelBench problem file")
     parser.add_argument("--output", required=True, help="Output file path for generated code")
     parser.add_argument("--prompt", default=None, help="Path to system prompt file (optional)")
@@ -426,6 +553,8 @@ def main():
                         help="Number of code samples to generate in parallel (default: 3)")
     parser.add_argument("--temperature", type=float, default=0.1,
                         help="Base temperature for LLM sampling (default: 0.1)")
+    parser.add_argument("--backend", choices=BACKENDS, default="hip",
+                        help="Backend type: 'hip' for HipKittens, 'triton' for Triton (default: hip)")
     args = parser.parse_args()
     
     # Load problem
@@ -435,6 +564,7 @@ def main():
     # Classify problem type for prompt selection
     problem_type = classify_problem(problem["name"], problem["code"])
     print(f"Problem type: {problem_type}")
+    print(f"Backend: {args.backend}")
     
     # Check LLM_GATEWAY_KEY for non-template cases
     if not os.environ.get("LLM_GATEWAY_KEY"):
@@ -442,8 +572,8 @@ def main():
         sys.exit(1)
     
     # Load prompt (use problem name to select appropriate prompt from config)
-    system_prompt = load_prompt(args.prompt, problem["name"])
-    user_prompt = build_user_prompt(problem)
+    system_prompt = load_prompt(args.prompt, problem["name"], backend=args.backend)
+    user_prompt = build_user_prompt(problem, backend=args.backend)
     
     # Ensure output directory exists
     output_dir = os.path.dirname(os.path.abspath(args.output))

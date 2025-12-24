@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Evaluate generated HipKittens kernel code.
-Usage: python eval.py --code <code_path> --problem <problem_path> [--output <result.json>]
+Evaluate generated HipKittens/Triton kernel code.
+Usage: python eval.py --code <code_path> --problem <problem_path> [--output <result.json>] [--backend hip|triton]
 """
 import os
 import sys
@@ -22,6 +22,9 @@ os.environ["PYTORCH_ROCM_ARCH"] = "gfx950"
 import torch
 import torch.nn as nn
 
+# Supported backends
+BACKENDS = ["hip", "triton"]
+
 
 def load_problem_module(problem_path: str):
     """Load reference model from problem file."""
@@ -34,12 +37,27 @@ def load_problem_module(problem_path: str):
     return exec_globals
 
 
-def load_generated_code(code_path: str):
-    """Load and compile generated code."""
+def load_generated_code(code_path: str, backend: str = "hip"):
+    """Load and compile generated code.
+    
+    For HIP backend: compiles C++/HIP code via load_inline
+    For Triton backend: directly executes Python/Triton code
+    """
     with open(code_path) as f:
         code = f.read()
     
     exec_globals = {'torch': torch, 'nn': nn}
+    
+    # For Triton backend, import triton modules
+    if backend == "triton":
+        try:
+            import triton
+            import triton.language as tl
+            exec_globals['triton'] = triton
+            exec_globals['tl'] = tl
+        except ImportError:
+            raise ImportError("Triton is required for triton backend. Install with: pip install triton")
+    
     exec(code, exec_globals)
     
     return exec_globals
@@ -259,11 +277,19 @@ with torch.no_grad():
     return perf_info
 
 
-def evaluate(problem_path: str, code_path: str, run_profiler: bool = False) -> dict:
-    """Evaluate generated code against reference."""
+def evaluate(problem_path: str, code_path: str, run_profiler: bool = False, backend: str = "hip") -> dict:
+    """Evaluate generated code against reference.
+    
+    Args:
+        problem_path: Path to KernelBench problem file
+        code_path: Path to generated code file
+        run_profiler: Whether to run rocprof analysis
+        backend: Backend type ('hip' or 'triton')
+    """
     result = {
         "problem": Path(problem_path).stem,
         "code_path": code_path,
+        "backend": backend,
         "compile_success": False,
         "accuracy_pass": False,
         "max_diff": float('inf'),
@@ -291,9 +317,9 @@ def evaluate(problem_path: str, code_path: str, run_profiler: bool = False) -> d
             return result
         
         # Load generated code
-        print(f"Loading generated code: {code_path}")
+        print(f"Loading generated code: {code_path} (backend={backend})")
         try:
-            gen_module = load_generated_code(code_path)
+            gen_module = load_generated_code(code_path, backend=backend)
             result["compile_success"] = True
         except Exception as e:
             # Capture full traceback for compile errors - this contains actual compiler messages
@@ -455,14 +481,16 @@ def evaluate(problem_path: str, code_path: str, run_profiler: bool = False) -> d
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate generated HipKittens kernel")
+    parser = argparse.ArgumentParser(description="Evaluate generated HipKittens/Triton kernel")
     parser.add_argument("--code", required=True, help="Path to generated code file")
     parser.add_argument("--problem", required=True, help="Path to KernelBench problem file")
     parser.add_argument("--output", default=None, help="Output JSON file for results")
     parser.add_argument("--profile", action="store_true", help="Run rocprof analysis for slow kernels")
+    parser.add_argument("--backend", choices=BACKENDS, default="hip",
+                        help="Backend type: 'hip' for HipKittens, 'triton' for Triton (default: hip)")
     args = parser.parse_args()
     
-    result = evaluate(args.problem, args.code, run_profiler=args.profile)
+    result = evaluate(args.problem, args.code, run_profiler=args.profile, backend=args.backend)
     
     # Print summary
     print("\n" + "=" * 60)

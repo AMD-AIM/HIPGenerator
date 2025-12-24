@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate-Evaluate-Profile Loop for HipKittens Kernel Generation.
+Generate-Evaluate-Profile Loop for HipKittens/Triton Kernel Generation.
 
 This script implements a complete feedback loop:
 1. Generate code using LLM
@@ -9,7 +9,7 @@ This script implements a complete feedback loop:
 4. Feed hints back to LLM for re-generation if needed
 
 Usage:
-    python run_loop.py --problem <problem_path> --max-attempts 3
+    python run_loop.py --problem <problem_path> --max-attempts 3 [--backend hip|triton]
 """
 import os
 import sys
@@ -22,9 +22,12 @@ from datetime import datetime
 
 os.environ["PYTORCH_ROCM_ARCH"] = "gfx950"
 
+# Supported backends
+BACKENDS = ["hip", "triton"]
+
 
 def run_generate(problem_path: str, output_path: str, num_samples: int = 3, 
-                 feedback: str = None, attempt: int = 1) -> list:
+                 feedback: str = None, attempt: int = 1, backend: str = "hip") -> list:
     """Run generate.py and return paths to generated samples."""
     script_dir = Path(__file__).parent
     
@@ -37,8 +40,12 @@ def run_generate(problem_path: str, output_path: str, num_samples: int = 3,
     prompt_file = None
     if extra_prompt:
         import tempfile
-        # Load base prompt
-        base_prompt_path = script_dir / "prompts" / "hipkittens_gemm_v4.txt"
+        # Load base prompt based on backend
+        if backend == "triton":
+            base_prompt_path = script_dir / "prompts" / "triton_gemm.txt"
+        else:
+            base_prompt_path = script_dir / "prompts" / "hipkittens_gemm_v4.txt"
+        
         if base_prompt_path.exists():
             base_prompt = base_prompt_path.read_text()
         else:
@@ -58,6 +65,7 @@ def run_generate(problem_path: str, output_path: str, num_samples: int = 3,
         "--output", output_path,
         "--num-samples", str(num_samples),
         "--temperature", "0.1",  # Low temp for focused generation
+        "--backend", backend,
     ]
     if prompt_file:
         cmd.extend(["--prompt", prompt_file])
@@ -96,7 +104,7 @@ def run_generate(problem_path: str, output_path: str, num_samples: int = 3,
     return samples
 
 
-def run_evaluate(code_path: str, problem_path: str, output_path: str) -> dict:
+def run_evaluate(code_path: str, problem_path: str, output_path: str, backend: str = "hip") -> dict:
     """Run eval.py and return results with profile info."""
     script_dir = Path(__file__).parent
     
@@ -105,6 +113,7 @@ def run_evaluate(code_path: str, problem_path: str, output_path: str) -> dict:
         "--code", code_path,
         "--problem", problem_path,
         "--output", output_path,
+        "--backend", backend,
     ]
     
     result = subprocess.run(cmd, capture_output=True, text=True, env=os.environ)
@@ -170,7 +179,8 @@ def build_feedback(results: list) -> str:
 
 
 def run_loop(problem_path: str, output_dir: str, max_attempts: int = 3, 
-             samples_per_attempt: int = 3, target_speedup: float = 0.9) -> dict:
+             samples_per_attempt: int = 3, target_speedup: float = 0.9,
+             backend: str = "hip") -> dict:
     """Run the complete generate-evaluate-profile loop."""
     
     problem_name = Path(problem_path).stem
@@ -179,6 +189,7 @@ def run_loop(problem_path: str, output_dir: str, max_attempts: int = 3,
     
     print(f"\n{'#'*70}")
     print(f"# PROBLEM: {problem_name}")
+    print(f"# Backend: {backend}")
     print(f"# Target speedup: >= {target_speedup}x")
     print(f"# Max attempts: {max_attempts}")
     print(f"{'#'*70}")
@@ -199,7 +210,8 @@ def run_loop(problem_path: str, output_dir: str, max_attempts: int = 3,
             problem_path, output_path, 
             num_samples=samples_per_attempt,
             feedback=feedback,
-            attempt=attempt
+            attempt=attempt,
+            backend=backend
         )
         
         if not samples:
@@ -212,7 +224,7 @@ def run_loop(problem_path: str, output_dir: str, max_attempts: int = 3,
             print(f"\n--- Evaluating sample {i+1}: {Path(sample_path).name} ---")
             result_path = str(problem_dir / f"result_{attempt}_s{i}.json")
             
-            result = run_evaluate(sample_path, problem_path, result_path)
+            result = run_evaluate(sample_path, problem_path, result_path, backend=backend)
             result["sample_path"] = sample_path
             results.append(result)
             
@@ -280,12 +292,16 @@ def main():
     parser.add_argument("--max-attempts", type=int, default=3, help="Max attempts per problem")
     parser.add_argument("--samples", type=int, default=3, help="Samples per attempt")
     parser.add_argument("--target-speedup", type=float, default=0.9, help="Target speedup (default 0.9x)")
+    parser.add_argument("--backend", choices=BACKENDS, default="hip",
+                        help="Backend type: 'hip' for HipKittens, 'triton' for Triton (default: hip)")
     args = parser.parse_args()
     
     # Check LLM key
     if not os.environ.get("LLM_GATEWAY_KEY"):
         print("Error: LLM_GATEWAY_KEY not set")
         sys.exit(1)
+    
+    print(f"Using backend: {args.backend}")
     
     # Handle multiple problems
     if ',' in args.problem:
@@ -305,7 +321,8 @@ def main():
             args.output,
             max_attempts=args.max_attempts,
             samples_per_attempt=args.samples,
-            target_speedup=args.target_speedup
+            target_speedup=args.target_speedup,
+            backend=args.backend
         )
         all_results.append(result)
     
