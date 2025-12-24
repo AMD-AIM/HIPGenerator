@@ -41,26 +41,44 @@ def load_generated_code(code_path: str, backend: str = "hip"):
     """Load and compile generated code.
     
     For HIP backend: compiles C++/HIP code via load_inline
-    For Triton backend: directly executes Python/Triton code
+    For Triton backend: imports as module (required for @triton.jit to get source)
     """
-    with open(code_path) as f:
-        code = f.read()
-    
-    exec_globals = {'torch': torch, 'nn': nn}
-    
-    # For Triton backend, import triton modules
     if backend == "triton":
+        # Triton's @triton.jit needs to read source code via inspect.getsourcelines()
+        # This requires the code to be in an actual file that can be imported
+        import importlib.util
+        import uuid
+        
+        # Generate unique module name to avoid caching issues
+        module_name = f"triton_gen_{uuid.uuid4().hex[:8]}"
+        
+        # Load the module from file
+        spec = importlib.util.spec_from_file_location(module_name, code_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load module from {code_path}")
+        
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        
         try:
-            import triton
-            import triton.language as tl
-            exec_globals['triton'] = triton
-            exec_globals['tl'] = tl
-        except ImportError:
-            raise ImportError("Triton is required for triton backend. Install with: pip install triton")
-    
-    exec(code, exec_globals)
-    
-    return exec_globals
+            spec.loader.exec_module(module)
+        except Exception as e:
+            # Clean up on failure
+            if module_name in sys.modules:
+                del sys.modules[module_name]
+            raise
+        
+        # Return module's namespace as dict
+        return {k: getattr(module, k) for k in dir(module) if not k.startswith('_')}
+    else:
+        # HIP backend: use exec() as before
+        with open(code_path) as f:
+            code = f.read()
+        
+        exec_globals = {'torch': torch, 'nn': nn}
+        exec(code, exec_globals)
+        
+        return exec_globals
 
 
 def benchmark(fn, warmup=10, iterations=100):
