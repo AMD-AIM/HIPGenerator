@@ -8,25 +8,25 @@
   "mean_diff": 0.0,
   "has_nan": false,
   "has_inf": false,
-  "ref_time_ms": 0.11564021930098534,
-  "new_time_ms": 0.3101106802932918,
-  "speedup": 0.37289982786667286,
-  "perf_analysis": "Kernel: matmul_kernel | Avg: 620.0us | GPU%: 95.3% | LDS: 128.0KB | Block: 512x1x1 | Hints: HIGH LDS USAGE (128.0KB): May limit occupancy, consider smaller tiles; HIGH VARIANCE (min=303.0us, max=1159.3us): Possible load imbalance",
+  "ref_time_ms": 0.11472837999463081,
+  "new_time_ms": 0.1585902296938002,
+  "speedup": 0.7234265327450743,
+  "perf_analysis": "Kernel: matmul_kernel | Avg: 283.0us | GPU%: 89.6% | LDS: 64.0KB | Block: 512x1x1 | Hints: HIGH LDS USAGE (64.0KB): May limit occupancy, consider smaller tiles; HIGH VARIANCE (min=142.6us, max=845.1us): Possible load imbalance",
   "error": null,
   "rocprof_metrics": {
     "kernel_name": "matmul_kernel",
-    "duration_ms": 643.547493,
+    "duration_ms": 4841.193935,
     "l2_cache_hit_rate": 0,
     "mfma_utilization_pct": 0,
     "optimization_hints": [
-      "HIGH LDS USAGE (128.0KB): May limit occupancy, consider smaller tiles",
-      "HIGH VARIANCE (min=303.0us, max=1159.3us): Possible load imbalance"
+      "HIGH LDS USAGE (64.0KB): May limit occupancy, consider smaller tiles",
+      "HIGH VARIANCE (min=142.6us, max=845.1us): Possible load imbalance"
     ],
     "raw_metrics": {
-      "min_us": 302.968,
-      "max_us": 1159.35,
-      "stddev_us": 290.8655171453002,
-      "lds_kb": 128.0
+      "min_us": 142.644,
+      "max_us": 845.062,
+      "stddev_us": 102.66240195538712,
+      "lds_kb": 64.0
     }
   }
 }

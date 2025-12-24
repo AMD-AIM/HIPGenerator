@@ -1,48 +1,8 @@
-You are an expert Triton programmer generating high-performance GEMM kernels for AMD MI300/MI350X GPUs.
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
 
-## GOAL
-Generate C = A @ B with maximum performance. Target: speedup >= 0.8x vs rocBLAS.
-
-## CRITICAL RULES
-
-1. **USE THE VERIFIED BASELINE KERNEL** - Do NOT modify kernel logic, only tune configs
-2. **DO NOT use Split-K** - bf16 atomic operations are unreliable  
-3. **EXHAUSTIVE AUTOTUNE** - Use ALL 30+ configs below for thorough search
-4. **Triton will cache** - Compilation happens once, then reuses binary
-
-## EXHAUSTIVE AUTOTUNE CONFIGS (COPY ALL 48 CONFIGS!)
-
-The key to good performance is exhaustive search. Use ALL these configs:
-
-```python
-def get_autotune_configs():
-    """Generate exhaustive autotune configs for AMD MI300X."""
-    configs = []
-    for BLOCK_M in [64, 128, 256]:
-        for BLOCK_N in [64, 128, 256]:
-            for BLOCK_K in [32, 64, 128]:
-                for GROUP_SIZE_M in [4, 8]:
-                    for num_stages in [1, 2, 3]:
-                        for num_warps in [4, 8]:
-                            # Skip invalid/suboptimal combos
-                            if BLOCK_M * BLOCK_N < 128 * 128 and num_warps == 8:
-                                continue
-                            if BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 128 and num_stages > 2:
-                                continue
-                            configs.append(triton.Config(
-                                {'BLOCK_M': BLOCK_M, 'BLOCK_N': BLOCK_N, 'BLOCK_K': BLOCK_K, 'GROUP_SIZE_M': GROUP_SIZE_M},
-                                num_stages=num_stages, num_warps=num_warps
-                            ))
-    return configs
-
-@triton.autotune(
-    configs=get_autotune_configs(),
-    key=['M', 'N', 'K'],
-)
-```
-
-Or use this pre-generated list (48 configs):
-```python
 @triton.autotune(
     configs=[
         # 256x256 tiles (large matrices)
@@ -53,13 +13,19 @@ Or use this pre-generated list (48 configs):
         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=8),
         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=8),
         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 4}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_SIZE_M': 4}, num_stages=1, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=8),
         # 256x128 / 128x256 tiles
         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_SIZE_M': 4}, num_stages=1, num_warps=8),
         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_SIZE_M': 8}, num_stages=1, num_warps=8),
         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 4}, num_stages=3, num_warps=8),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_SIZE_M': 4}, num_stages=1, num_warps=8),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_SIZE_M': 8}, num_stages=1, num_warps=8),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_SIZE_M': 4}, num_stages=3, num_warps=8),
         # 128x128 tiles (balanced)
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_SIZE_M': 4}, num_stages=1, num_warps=4),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_SIZE_M': 8}, num_stages=1, num_warps=4),
@@ -77,50 +43,23 @@ Or use this pre-generated list (48 configs):
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_SIZE_M': 4}, num_stages=1, num_warps=4),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=4),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 4}, num_stages=3, num_warps=4),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_SIZE_M': 4}, num_stages=1, num_warps=4),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=4),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 4}, num_stages=3, num_warps=4),
         # 64x64 tiles (small matrices)
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_SIZE_M': 4}, num_stages=1, num_warps=4),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_SIZE_M': 4}, num_stages=1, num_warps=4),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=1, num_warps=4),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=4),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_SIZE_M': 4}, num_stages=3, num_warps=4),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=4),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
+        # Additional configs for edge cases
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 4}, num_stages=2, num_warps=4),
     ],
-    key=['M', 'N', 'K'],
-)
-```
-
-## BASELINE MATMUL KERNEL (Copy this exactly!)
-
-```python
-import torch
-import torch.nn as nn
-import triton
-import triton.language as tl
-
-def get_autotune_configs():
-    """Generate exhaustive autotune configs for AMD MI300X."""
-    configs = []
-    for BLOCK_M in [64, 128, 256]:
-        for BLOCK_N in [64, 128, 256]:
-            for BLOCK_K in [32, 64, 128]:
-                for GROUP_SIZE_M in [4, 8]:
-                    for num_stages in [1, 2, 3]:
-                        for num_warps in [4, 8]:
-                            if BLOCK_M * BLOCK_N < 128 * 128 and num_warps == 8:
-                                continue
-                            if BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 128 and num_stages > 2:
-                                continue
-                            configs.append(triton.Config(
-                                {'BLOCK_M': BLOCK_M, 'BLOCK_N': BLOCK_N, 'BLOCK_K': BLOCK_K, 'GROUP_SIZE_M': GROUP_SIZE_M},
-                                num_stages=num_stages, num_warps=num_warps
-                            ))
-    return configs
-
-@triton.autotune(
-    configs=get_autotune_configs(),
     key=['M', 'N', 'K'],
 )
 @triton.jit
@@ -179,63 +118,24 @@ def matmul(a, b):
         a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1),
     )
     return c
-```
 
-## FUSED GEMM + ACTIVATION (for Level2 problems)
 
-Apply activation IN the kernel BEFORE storing:
+class ModelNew(nn.Module):
+    """
+    Optimized model using Triton kernel for matrix multiplication
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs matrix multiplication using Triton kernel.
 
-```python
-# ReLU
-c = tl.maximum(accumulator, 0.0).to(tl.bfloat16)
+        Args:
+            A: Input tensor of shape (M, K).
+            B: Input tensor of shape (K, N).
 
-# LeakyReLU(alpha)
-c = tl.where(accumulator >= 0, accumulator, alpha * accumulator).to(tl.bfloat16)
-
-# GELU (approximate)
-x = accumulator
-c = (0.5 * x * (1.0 + tl.tanh(0.7978845608 * (x + 0.044715 * x * x * x)))).to(tl.bfloat16)
-
-# Mish
-x = accumulator  
-softplus = tl.log(1.0 + tl.exp(x))
-c = (x * tl.tanh(softplus)).to(tl.bfloat16)
-
-# Sigmoid
-c = (1.0 / (1.0 + tl.exp(-accumulator))).to(tl.bfloat16)
-
-# Scaling
-c = (accumulator * scale_factor).to(tl.bfloat16)
-
-# Residual add (load residual, add to accumulator)
-residual = tl.load(residual_ptr + offs_cm[:, None] * stride_rm + offs_cn[None, :] * stride_rn, mask=c_mask)
-c = (accumulator + residual.to(tl.float32)).to(tl.bfloat16)
-```
-
-## TRANSPOSED INPUTS
-
-For A.T @ B or A @ B.T, swap strides:
-```python
-# A @ B.T where B is [N, K]
-matmul_kernel[grid](
-    a, b, c, M, N, K,
-    a.stride(0), a.stride(1),
-    b.stride(1), b.stride(0),  # Swapped!
-    c.stride(0), c.stride(1),
-)
-```
-
-## PROFILER FEEDBACK HINTS
-
-If you receive profiler feedback, apply these fixes:
-- "LOW OCCUPANCY": Reduce BLOCK_M/BLOCK_N, increase num_warps
-- "MEMORY BOUND": Increase BLOCK_K, add prefetching
-- "HIGH BANK CONFLICTS": Use swizzled offsets
-- "LOW IPC": Interleave more independent operations
-
-## OUTPUT FORMAT
-- Output ONLY Python code in ```python ... ``` block
-- Pick ONE strategy and implement it DIFFERENTLY from other samples
-- Include complete kernel with @triton.autotune
-- Include complete ModelNew class
-- NO explanations outside code block
+        Returns:
+            Output tensor of shape (M, N).
+        """
+        return matmul(A, B)

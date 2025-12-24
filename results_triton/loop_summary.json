@@ -1,45 +1,45 @@
 {
-  "timestamp": "2025-12-24T08:53:48.987890",
+  "timestamp": "2025-12-24T09:19:30.541082",
   "results": [
     {
-      "problem": "76_Gemm_Add_ReLU",
+      "problem": "2_Standard_matrix_multiplication_",
       "status": "success",
-      "best_speedup": 0.6840280460339629,
-      "best_code": "results_triton/76_Gemm_Add_ReLU/code_3.py",
+      "best_speedup": 0.6893292690034077,
+      "best_code": "results_triton/2_Standard_matrix_multiplication_/code_1.py",
       "best_result": {
-        "problem": "76_Gemm_Add_ReLU",
-        "code_path": "results_triton/76_Gemm_Add_ReLU/code_3.py",
+        "problem": "2_Standard_matrix_multiplication_",
+        "code_path": "results_triton/2_Standard_matrix_multiplication_/code_1.py",
         "backend": "triton",
         "compile_success": true,
         "accuracy_pass": true,
-        "max_diff": 0.015625,
-        "mean_diff": 0.0002860085805878043,
+        "max_diff": 0.0,
+        "mean_diff": 0.0,
         "has_nan": false,
         "has_inf": false,
-        "ref_time_ms": 0.14623892959207296,
-        "new_time_ms": 0.2137908386066556,
-        "speedup": 0.6840280460339629,
-        "perf_analysis": "Kernel: matmul_bias_relu_kernel | Avg: 358.5us | GPU%: 92.5% | LDS: 128.0KB | Block: 512x1x1 | Hints: HIGH LDS USAGE (128.0KB): May limit occupancy, consider smaller tiles; HIGH VARIANCE (min=186.1us, max=2037.9us): Possible load imbalance",
+        "ref_time_ms": 0.13769607059657574,
+        "new_time_ms": 0.19975369796156883,
+        "speedup": 0.6893292690034077,
+        "perf_analysis": "Kernel: matmul_kernel | Avg: 299.5us | GPU%: 90.7% | LDS: 64.0KB | Block: 512x1x1 | Hints: HIGH LDS USAGE (64.0KB): May limit occupancy, consider smaller tiles; HIGH VARIANCE (min=182.6us, max=2146.6us): Possible load imbalance",
         "error": null,
         "rocprof_metrics": {
-          "kernel_name": "matmul_bias_relu_kernel",
-          "duration_ms": 632.328878,
+          "kernel_name": "matmul_kernel",
+          "duration_ms": 5159.250107,
           "l2_cache_hit_rate": 0,
           "mfma_utilization_pct": 0,
           "optimization_hints": [
-            "HIGH LDS USAGE (128.0KB): May limit occupancy, consider smaller tiles",
-            "HIGH VARIANCE (min=186.1us, max=2037.9us): Possible load imbalance"
+            "HIGH LDS USAGE (64.0KB): May limit occupancy, consider smaller tiles",
+            "HIGH VARIANCE (min=182.6us, max=2146.6us): Possible load imbalance"
           ],
           "raw_metrics": {
-            "min_us": 186.125,
-            "max_us": 2037.893,
-            "stddev_us": 266.4448034193124,
-            "lds_kb": 128.0
+            "min_us": 182.565,
+            "max_us": 2146.615,
+            "stddev_us": 174.15406938952995,
+            "lds_kb": 64.0
           }
         },
-        "sample_path": "results_triton/76_Gemm_Add_ReLU/code_3.py"
+        "sample_path": "results_triton/2_Standard_matrix_multiplication_/code_1.py"
       },
-      "attempts": 3
+      "attempts": 1
     }
   ]
 }
