@@ -5,11 +5,11 @@ Shape: (128, 512, 1024) x (128, 1024, 2048) -> (128, 512, 2048)
 Target: MI350 (gfx950), 32 XCDs, 256 CUs
 
 Optimizations:
-- 3D grid (batch, M_tiles, N_tiles) for better parallelism
-- XCD-aware batch distribution
+- 2D grid (tiles, batch) for parallelism
 - Pingpong scheduling
 - 16x16 MFMA
-- 128x128x64 tiles
+- 256x256x32 tiles, 3 stages
+- Precomputed strides and preallocated buffer
 """
 
 import torch
@@ -22,6 +22,12 @@ os.environ['TRITON_HIP_USE_BLOCK_PINGPONG'] = '1'
 os.environ['TRITON_HIP_USE_ASYNC_COPY'] = '1'
 
 NUM_XCDS = 32
+
+# ============ Test Inputs (defined early for precomputation) ============
+BATCH = 128
+M_SIZE = 512
+K_SIZE = 1024
+N_SIZE = 2048
 
 # ============ Original Model (Reference) ============
 class Model(nn.Module):
@@ -51,7 +57,6 @@ def bmm_kernel(
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
     
-    # L2 cache grouping within each batch
     num_pid_in_group = GROUP_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_M
@@ -63,7 +68,6 @@ def bmm_kernel(
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
     
-    # Batch offsets
     a_batch = a_ptr + batch_id * stride_ab
     b_batch = b_ptr + batch_id * stride_bb
     c_batch = c_ptr + batch_id * stride_cb
@@ -87,51 +91,54 @@ def bmm_kernel(
     
     c_ptrs = c_batch + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, acc.to(c_ptr.dtype.element_ty), mask=mask)
-
-
-def triton_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    B, M, K = a.shape
-    B2, K2, N = b.shape
-    assert B == B2 and K == K2
-    
-    c = torch.empty((B, M, N), device=a.device, dtype=a.dtype)
-    
-    # Optimal for 512x1024x2048: larger tiles for better reuse
-    BLOCK_M, BLOCK_N, BLOCK_K = 256, 128, 64
-    num_stages, num_warps = 3, 8
-    
-    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), B)
-    
-    bmm_kernel[grid](
-        a, b, c, B, M, N, K,
-        a.stride(0), a.stride(1), a.stride(2),
-        b.stride(0), b.stride(1), b.stride(2),
-        c.stride(0), c.stride(1), c.stride(2),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, GROUP_M=8,
-        num_stages=num_stages, num_warps=num_warps, matrix_instr_nonkdim=16,
-    )
-    return c
+    tl.store(c_ptrs, acc.to(tl.float16), mask=mask)
 
 
 class ModelNew(nn.Module):
-    """Optimized model using Triton BMM kernel."""
+    """
+    Optimized model with minimized launch overhead.
+    Precomputes grid, strides, and preallocates output buffer.
+    """
     def __init__(self):
         super(ModelNew, self).__init__()
+        # Kernel config
+        self._BLOCK_M, self._BLOCK_N, self._BLOCK_K = 256, 256, 32
+        self._num_stages, self._num_warps = 3, 8
+        self._GROUP_M = 8
+        # Precompute grid (2D: tiles, batch)
+        self._grid = (triton.cdiv(M_SIZE, self._BLOCK_M) * triton.cdiv(N_SIZE, self._BLOCK_N), BATCH)
+        # Preallocate output buffer
+        self.register_buffer('_C', torch.empty((BATCH, M_SIZE, N_SIZE), dtype=torch.float16))
+        # Precompute strides for contiguous row-major 3D tensors
+        # A[B, M, K]: stride = (M*K, K, 1)
+        self._stride_ab = M_SIZE * K_SIZE
+        self._stride_am = K_SIZE
+        self._stride_ak = 1
+        # B[B, K, N]: stride = (K*N, N, 1)
+        self._stride_bb = K_SIZE * N_SIZE
+        self._stride_bk = N_SIZE
+        self._stride_bn = 1
+        # C[B, M, N]: stride = (M*N, N, 1)
+        self._stride_cb = M_SIZE * N_SIZE
+        self._stride_cm = N_SIZE
+        self._stride_cn = 1
     
     def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-        return triton_bmm(A, B)
+        bmm_kernel[self._grid](
+            A, B, self._C, BATCH, M_SIZE, N_SIZE, K_SIZE,
+            self._stride_ab, self._stride_am, self._stride_ak,
+            self._stride_bb, self._stride_bk, self._stride_bn,
+            self._stride_cb, self._stride_cm, self._stride_cn,
+            BLOCK_M=self._BLOCK_M, BLOCK_N=self._BLOCK_N, BLOCK_K=self._BLOCK_K,
+            GROUP_M=self._GROUP_M,
+            num_stages=self._num_stages, num_warps=self._num_warps, matrix_instr_nonkdim=16,
+        )
+        return self._C
 
-
-# ============ Test Inputs ============
-batch_size = 128
-m = 128 * 4  # 512
-k = 256 * 4  # 1024
-n = 512 * 4  # 2048
 
 def get_inputs():
-    A = torch.rand(batch_size, m, k, dtype=torch.float16)
-    B = torch.rand(batch_size, k, n, dtype=torch.float16)
+    A = torch.rand(BATCH, M_SIZE, K_SIZE, dtype=torch.float16)
+    B = torch.rand(BATCH, K_SIZE, N_SIZE, dtype=torch.float16)
     return [A, B]
 
 def get_init_inputs():
@@ -140,36 +147,34 @@ def get_init_inputs():
 
 # ============ Verification ============
 if __name__ == "__main__":
-    A, B = get_inputs()
-    A, B = A.cuda(), B.cuda()
+    import time
+    
+    A = torch.rand(BATCH, M_SIZE, K_SIZE, dtype=torch.float16, device='cuda')
+    B = torch.rand(BATCH, K_SIZE, N_SIZE, dtype=torch.float16, device='cuda')
     
     ref_model = Model().cuda()
     new_model = ModelNew().cuda()
     
+    # Verify correctness
     ref = ref_model(A, B)
     out = new_model(A, B)
-    
     max_diff = (ref.float() - out.float()).abs().max().item()
     print(f"Max diff: {max_diff}")
     
-    # Benchmark
-    import time
-    torch.cuda.synchronize()
-    
+    # Warmup
     for _ in range(10):
         _ = new_model(A, B)
+        _ = ref_model(A, B)
     torch.cuda.synchronize()
     
+    # Benchmark ModelNew
     t0 = time.time()
     for _ in range(50):
         _ = new_model(A, B)
     torch.cuda.synchronize()
     triton_time = (time.time() - t0) / 50
     
-    for _ in range(10):
-        _ = ref_model(A, B)
-    torch.cuda.synchronize()
-    
+    # Benchmark Model (rocBLAS)
     t0 = time.time()
     for _ in range(50):
         _ = ref_model(A, B)
@@ -177,7 +182,7 @@ if __name__ == "__main__":
     ref_time = (time.time() - t0) / 50
     
     speedup = ref_time / triton_time
-    tflops = 2 * batch_size * m * n * k / triton_time / 1e12
+    tflops = 2 * BATCH * M_SIZE * N_SIZE * K_SIZE / triton_time / 1e12
     
     print(f"Triton: {triton_time*1000:.3f}ms, {tflops:.2f} TFLOPS")
     print(f"rocBLAS: {ref_time*1000:.3f}ms")

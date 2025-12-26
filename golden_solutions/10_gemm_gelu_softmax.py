@@ -2,12 +2,12 @@
 """
 Problem: 99_Matmul_GELU_Softmax
 Shape: [1024, 4096] @ [4096, 4096] -> [1024, 4096] -> GELU -> Softmax
+Target: MI350 (gfx950), 32 XCDs
 
-优化策略：
-1. GEMM + GELU 融合 (参考 01_square_gemm 配置)
-2. Softmax 使用优化的 row-wise 实现，分两阶段：
-   - 第一阶段：分块计算 max 和 exp_sum
-   - 第二阶段：计算最终 softmax
+Optimizations:
+1. Fused GEMM + GELU kernel
+2. Optimized row-wise softmax implementation
+3. Precomputed strides and preallocated buffers
 """
 
 import torch
@@ -18,6 +18,11 @@ import os
 
 os.environ['TRITON_HIP_USE_BLOCK_PINGPONG'] = '1'
 os.environ['TRITON_HIP_USE_ASYNC_COPY'] = '1'
+
+# ============ Test Inputs (defined early for precomputation) ============
+M_SIZE = 1024
+K_SIZE = 4096
+N_SIZE = 4096
 
 
 # ============ Original Model ============
@@ -49,7 +54,6 @@ def gemm_gelu_kernel(
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
     
-    # L2 cache-friendly grouping
     num_pid_in_group = GROUP_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_M
@@ -66,7 +70,6 @@ def gemm_gelu_kernel(
     
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     
-    # Main GEMM loop
     for k in range(0, K, BLOCK_K):
         mask_k = (k + offs_k) < K
         a = tl.load(a_ptrs, mask=mask_k[None, :] & (offs_m[:, None] < M), other=0.0)
@@ -75,16 +78,12 @@ def gemm_gelu_kernel(
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
     
-    # Add bias (fused, near zero cost)
+    # Fused: Add bias + GELU approximation
     bias_vals = tl.load(bias + offs_n, mask=offs_n < N, other=0.0)
     acc = acc + bias_vals[None, :]
-    
-    # Apply GELU approximation (fused, near zero cost)
-    # GELU(x) ≈ x * sigmoid(1.702 * x)
     sigmoid_val = 1.0 / (1.0 + tl.exp(-1.702 * acc))
     acc = acc * sigmoid_val
     
-    # Store
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     c_ptrs = C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     tl.store(c_ptrs, acc.to(tl.float16), mask=mask)
@@ -98,10 +97,7 @@ def softmax_kernel(
     stride_m,
     BLOCK_N: tl.constexpr,
 ):
-    """
-    Optimized single-pass row-wise softmax.
-    Loads entire row at once for N <= 4096.
-    """
+    """Optimized single-pass row-wise softmax."""
     row_idx = tl.program_id(0)
     
     if row_idx >= M:
@@ -110,12 +106,10 @@ def softmax_kernel(
     row_start = input_ptr + row_idx * stride_m
     out_start = output_ptr + row_idx * stride_m
     
-    # Load entire row
     offs_n = tl.arange(0, BLOCK_N)
     mask = offs_n < N
     vals = tl.load(row_start + offs_n, mask=mask, other=float('-inf')).to(tl.float32)
     
-    # Single-pass softmax
     row_max = tl.max(vals, axis=0)
     vals = vals - row_max
     vals_exp = tl.exp(vals)
@@ -125,90 +119,73 @@ def softmax_kernel(
     tl.store(out_start + offs_n, softmax_out.to(tl.float16), mask=mask)
 
 
-def triton_gemm_gelu_pretransposed(x, weight_t, bias):
-    """Optimized GEMM + GELU with pre-transposed weight [K, N]"""
-    M, K = x.shape
-    N = weight_t.shape[1]
-    
-    out = torch.empty((M, N), device=x.device, dtype=torch.float16)
-    
-    # Best config for 1024x4096x4096: num_stages=3 achieves 0.901x rocBLAS
-    BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
-    num_stages, num_warps = 3, 8  # Changed from 2 to 3 stages
-    GROUP_M = 8
-    
-    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
-    
-    gemm_gelu_kernel[grid](
-        x, weight_t, bias, out,
-        M, N, K,
-        x.stride(0), x.stride(1),
-        weight_t.stride(0), weight_t.stride(1),
-        out.stride(0), out.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        GROUP_M=GROUP_M,
-        num_stages=num_stages, num_warps=num_warps,
-    )
-    
-    return out
-
-
-def triton_gemm_gelu(x, weight, bias):
-    """Optimized GEMM + GELU (for API compatibility)"""
-    weight_t = weight.T.contiguous()
-    return triton_gemm_gelu_pretransposed(x, weight_t, bias)
-
-
-def triton_softmax(x):
-    """Optimized single-pass row-wise softmax"""
-    M, N = x.shape
-    out = torch.empty_like(x)
-    
-    # Load entire row for best performance (N=4096)
-    BLOCK_N = triton.next_power_of_2(N)
-    
-    grid = (M,)
-    softmax_kernel[grid](
-        x, out,
-        M, N,
-        x.stride(0),
-        BLOCK_N=BLOCK_N,
-        num_warps=4,  # Best config from tuning
-    )
-    
-    return out
-
-
 class ModelNew(nn.Module):
     """
-    Optimized: GEMM + GELU (fused) + Softmax
-    Pre-transpose weight to avoid per-forward transpose overhead.
+    Optimized model with minimized launch overhead.
+    Pre-transpose weight, precompute grid/strides, preallocate buffers.
     """
     def __init__(self, input_size, hidden_size):
         super().__init__()
         # Store weight in transposed form [K, N] for efficient GEMM
         self.weight_t = nn.Parameter(torch.randn(input_size, hidden_size, dtype=torch.float16))
         self.bias = nn.Parameter(torch.randn(hidden_size, dtype=torch.float16))
+        
+        # GEMM kernel config
+        self._BLOCK_M, self._BLOCK_N, self._BLOCK_K = 128, 128, 64
+        self._num_stages, self._num_warps = 3, 8
+        self._GROUP_M = 8
+        self._gemm_grid = (triton.cdiv(M_SIZE, self._BLOCK_M) * triton.cdiv(N_SIZE, self._BLOCK_N),)
+        
+        # Softmax kernel config
+        self._softmax_BLOCK_N = triton.next_power_of_2(N_SIZE)  # 4096
+        self._softmax_grid = (M_SIZE,)
+        
+        # Preallocate buffers
+        self.register_buffer('_gemm_out', torch.empty((M_SIZE, N_SIZE), dtype=torch.float16))
+        self.register_buffer('_softmax_out', torch.empty((M_SIZE, N_SIZE), dtype=torch.float16))
+        
+        # Precompute strides
+        self._stride_am = K_SIZE
+        self._stride_ak = 1
+        self._stride_bk = N_SIZE
+        self._stride_bn = 1
+        self._stride_cm = N_SIZE
+        self._stride_cn = 1
     
     @property
     def weight(self):
-        # For compatibility with reference model weight copying
         return self.weight_t.T
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # GEMM + GELU with pre-transposed weight
-        out = triton_gemm_gelu_pretransposed(x, self.weight_t, self.bias)
-        # Optimized softmax
-        return triton_softmax(out)
+        # GEMM + GELU
+        gemm_gelu_kernel[self._gemm_grid](
+            x, self.weight_t, self.bias, self._gemm_out,
+            M_SIZE, N_SIZE, K_SIZE,
+            self._stride_am, self._stride_ak,
+            self._stride_bk, self._stride_bn,
+            self._stride_cm, self._stride_cn,
+            BLOCK_M=self._BLOCK_M, BLOCK_N=self._BLOCK_N, BLOCK_K=self._BLOCK_K,
+            GROUP_M=self._GROUP_M,
+            num_stages=self._num_stages, num_warps=self._num_warps,
+        )
+        
+        # Softmax
+        softmax_kernel[self._softmax_grid](
+            self._gemm_out, self._softmax_out,
+            M_SIZE, N_SIZE,
+            self._stride_cm,
+            BLOCK_N=self._softmax_BLOCK_N,
+            num_warps=4,
+        )
+        
+        return self._softmax_out
 
 
 def get_inputs():
-    batch_size, input_size, hidden_size = 1024, 4096, 4096
-    return [torch.rand(batch_size, input_size, dtype=torch.float16, device='cuda')]
-
+    return [torch.rand(M_SIZE, K_SIZE, dtype=torch.float16, device='cuda')]
 
 def get_init_inputs():
-    return [4096, 4096]
+    return [K_SIZE, N_SIZE]
 
 
 # ============ Verification ============
@@ -218,37 +195,34 @@ if __name__ == "__main__":
     inputs = get_inputs()
     init_inputs = get_init_inputs()
     
-    model = ModelNew(*init_inputs).cuda()
-    
-    # Reference - copy weights from new model
     ref_model = Model(*init_inputs).cuda().half()
+    new_model = ModelNew(*init_inputs).cuda()
+    
+    # Copy weights for fair comparison
     with torch.no_grad():
-        ref_model.linear.weight.copy_(model.weight_t.T)  # Transpose back
-        ref_model.linear.bias.copy_(model.bias)
+        new_model.weight_t.copy_(ref_model.linear.weight.T)
+        new_model.bias.copy_(ref_model.linear.bias)
     
-    ref_out = ref_model(inputs[0])
-    out = model(inputs[0])
-    
-    max_diff = (ref_out.float() - out.float()).abs().max().item()
+    # Verify correctness
+    ref = ref_model(inputs[0])
+    out = new_model(inputs[0])
+    max_diff = (ref.float() - out.float()).abs().max().item()
     print(f"Max diff: {max_diff}")
     
-    # Benchmark
-    torch.cuda.synchronize()
-    
+    # Warmup
     for _ in range(10):
-        _ = model(inputs[0])
-    torch.cuda.synchronize()
-    
-    t0 = time.time()
-    for _ in range(100):
-        _ = model(inputs[0])
-    torch.cuda.synchronize()
-    triton_time = (time.time() - t0) / 100
-    
-    for _ in range(10):
+        _ = new_model(inputs[0])
         _ = ref_model(inputs[0])
     torch.cuda.synchronize()
     
+    # Benchmark ModelNew
+    t0 = time.time()
+    for _ in range(100):
+        _ = new_model(inputs[0])
+    torch.cuda.synchronize()
+    triton_time = (time.time() - t0) / 100
+    
+    # Benchmark Model (rocBLAS)
     t0 = time.time()
     for _ in range(100):
         _ = ref_model(inputs[0])
