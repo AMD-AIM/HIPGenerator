@@ -1,8 +1,8 @@
 {
-  "description": "Prompt configuration for HipKittens/Triton kernel generation with adaptive tile sizes",
+  "description": "Prompt configuration for HipKittens/Triton kernel generation",
   
   "default_prompt": "hipkittens_base.txt",
-  "triton_default_prompt": "triton_gemm_mi350_golden.txt",
+  "triton_default_prompt": "triton_elementwise.txt",
   
   "patterns": {
     "matmul|matrix_mult|gemm|mm_|square.*matrix|standard.*matrix": "hipkittens_gemm.txt",
@@ -24,16 +24,21 @@
     "bmm|batched.*matrix|3d.*matrix|4d.*matrix": "triton_gemm_mi350_golden.txt",
     "mv_|matvec|matrix_vector": "triton_gemm_mi350_golden.txt",
     "linear|fc|dense|mlp": "triton_gemm_mi350_golden.txt",
-    "gemm.*add|add.*relu|gemm.*relu|gemm.*bias|bias.*relu": "triton_gemm_mi350_golden.txt",
-    "relu|sigmoid|tanh|gelu|selu|elu|softplus|softsign|leaky|hard|silu|swish|mish|divide": "triton_gemm_mi350_golden.txt",
-    "softmax|logsoftmax": "triton_gemm_mi350_golden.txt",
-    "layernorm|batchnorm|groupnorm|instancenorm|rmsnorm": "triton_gemm_mi350_golden.txt",
-    "norm_|frobenius|l1norm|l2norm": "triton_gemm_mi350_golden.txt",
-    "pool|max_|mean_|sum_|argmax|argmin|min_": "triton_gemm_mi350_golden.txt",
-    "scaling|residual|add": "triton_gemm_mi350_golden.txt",
-    "transposed": "triton_gemm_mi350_golden.txt"
+    "transposed": "triton_gemm_mi350_golden.txt",
+    
+    "relu|sigmoid|tanh|gelu|selu|elu|softplus|softsign|leaky|hard|silu|swish|mish": "triton_elementwise.txt",
+    "softmax|logsoftmax": "triton_elementwise.txt",
+    "layernorm|batchnorm|groupnorm|instancenorm|rmsnorm": "triton_elementwise.txt",
+    "norm_|frobenius|l1norm|l2norm": "triton_elementwise.txt",
+    "pool|max_|mean_|sum_|argmax|argmin|min_|cumprod": "triton_elementwise.txt",
+    "scalar": "triton_elementwise.txt"
   },
   
+  "triton_level2_patterns": {
+    "gemm.*add|add.*relu|gemm.*relu|gemm.*bias|bias.*relu": "triton_gemm_mi350_golden.txt",
+    "scaling|residual|add|divide|multiply|subtract": "triton_gemm_mi350_golden.txt"
+  },
+
   "reflection_hints": {
     "PERFORMANCE TOO SLOW": [
       "Check adaptive block size: 256x256 for min(M,N)>=512, else 128x128",
@@ -49,14 +54,6 @@
       "CRITICAL: Use s_waitcnt vmcnt(0) after G::load",
       "CRITICAL: Use s_waitcnt lgkmcnt(0) after shared->register load",
       "Use subtile_inplace to extract per-warp data from shared tiles"
-    ],
-    "dimensions not aligned": [
-      "Pad M, N to block size (128 or 256), K to 64",
-      "Use slice to extract original dimensions from result"
-    ],
-    "torch.mm|torch.matmul": [
-      "FORBIDDEN! Never use PyTorch GEMM APIs",
-      "Use custom HipKittens/Triton kernel instead"
     ]
   },
   
@@ -64,58 +61,12 @@
     "PERFORMANCE TOO SLOW (<0.5x)": [
       "CRITICAL: Add XCD swizzle for MI350's 32 XCDs - without it you get ~0.3-0.5x!",
       "Use: pids_per_xcd = (num_pids + 31) // 32; xcd_id = pid % 32; local_pid = pid // 32",
-      "Then: remapped_pid = xcd_id * pids_per_xcd + local_pid",
-      "Set NUM_XCDS = 32 (MI350 has 32 XCDs, NOT 8!)",
-      "Set matrix_instr_nonkdim=16 in kernel launch for 16x16 MFMA"
-    ],
-    "PERFORMANCE MODERATE (0.5x-0.8x)": [
-      "Enable pingpong: os.environ['TRITON_HIP_USE_BLOCK_PINGPONG'] = '1'",
-      "Use optimal block sizes: 256x256x32 for square, 128x128x64 for large K",
-      "Add L2 grouping with GROUP_M=8 to 16",
-      "Use num_stages=2 or 3, num_warps=8"
-    ],
-    "PERFORMANCE CLOSE (0.8x-1.0x)": [
-      "Eliminate launch overhead: precompute grid/strides in __init__",
-      "Preallocate output with register_buffer",
-      "Remove all .stride() calls from forward() - use precomputed values",
-      "Consider removing masks for perfectly aligned dimensions"
-    ],
-    "Compile error": [
-      "matrix_instr_nonkdim goes in kernel launch, NOT triton.Config()",
-      "Check tl.constexpr parameters are passed correctly at compile time",
-      "Use proper Triton dtypes: tl.float16, tl.bfloat16, tl.float32"
+      "Then: remapped_pid = xcd_id * pids_per_xcd + local_pid"
     ],
     "accuracy.*fail|max diff|NaN": [
-      "For nn.Linear: weight is [out, in], swap strides to treat as transposed",
-      "Use float32 accumulator: acc = tl.zeros(..., dtype=tl.float32)",
-      "Check mask: k_mask = (k + tl.arange(0, BLOCK_K)) < K, NOT offs_k < K",
-      "NEVER use .T or .trans() inside kernel - handle via stride swapping"
-    ]
-  },
-  
-  "block_size_selection": {
-    "description": "Adaptive block size based on matrix dimensions",
-    "large_threshold": 512,
-    "large_config": {
-      "BLOCK_SIZE": 256,
-      "warps": "2x4=8",
-      "note": "Each warp computes 2x2 tiles of 64x32"
-    },
-    "small_config": {
-      "BLOCK_SIZE": 128,
-      "warps": "2x4=8", 
-      "note": "Each warp computes 1 tile of 32x16"
-    },
-    "K_STEP": 64
-  },
-  
-  "triton_autotune_configs": {
-    "description": "Common Triton autotune configurations for AMD GPUs",
-    "gemm_configs": [
-      {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8, "num_stages": 3, "num_warps": 8},
-      {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 8, "num_stages": 4, "num_warps": 4},
-      {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_SIZE_M": 8, "num_stages": 4, "num_warps": 4},
-      {"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8, "num_stages": 3, "num_warps": 8}
+      "Use float32 accumulator for all computation",
+      "Convert back to input dtype at store: y.to(tl.float16)",
+      "Check if input is float16 or bfloat16 and match output dtype"
     ]
   }
 }

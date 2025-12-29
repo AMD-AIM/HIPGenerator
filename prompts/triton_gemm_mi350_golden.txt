@@ -42,7 +42,8 @@ Groups adjacent tiles for L2 cache reuse:
 num_pid_in_group = GROUP_M * num_pid_n
 group_id = pid // num_pid_in_group
 first_pid_m = group_id * GROUP_M
-group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+# IMPORTANT: Use tl.minimum, NOT Python's min()
+group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_M)
 pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
 pid_n = (pid % num_pid_in_group) // group_size_m
 ```
@@ -139,7 +140,8 @@ def matmul_kernel(
     num_pid_in_group = GROUP_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    # Use tl.minimum instead of Python min for JIT compatibility
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
     # ============ END L2 GROUPING ============
@@ -271,6 +273,81 @@ acc = acc / divisor
 # Store
 tl.store(c_ptrs, acc.to(tl.float16), mask=mask)
 ```
+
+## HANDLING SCALAR PARAMETERS (CRITICAL!)
+
+When your kernel needs scalar parameters like `multiplier`, `alpha`, `negative_slope`, `divisor`:
+
+### Option 1: NO autotune (Recommended for fused ops with scalar params)
+Use fixed configuration instead of @triton.autotune:
+
+```python
+@triton.jit
+def fused_kernel(
+    a_ptr, b_ptr, c_ptr, M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    multiplier,  # Scalar works fine without autotune
+    negative_slope,  # Scalar works fine without autotune
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr, NUM_XCDS: tl.constexpr,
+):
+    ...
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super().__init__()
+        self.multiplier = multiplier
+        self.negative_slope = negative_slope
+        # Use optimal fixed config for the problem size
+        self.BLOCK_M, self.BLOCK_N, self.BLOCK_K = 128, 128, 64
+        self.GROUP_M = 8
+        self.num_stages, self.num_warps = 2, 8
+    
+    def forward(self, x):
+        M, K = x.shape
+        N = self.out_features
+        grid = (triton.cdiv(M, self.BLOCK_M) * triton.cdiv(N, self.BLOCK_N),)
+        out = torch.empty((M, N), dtype=x.dtype, device=x.device)
+        
+        fused_kernel[grid](
+            x, self.weight, out, M, N, K,
+            x.stride(0), x.stride(1), ...,
+            self.multiplier, self.negative_slope,  # Pass scalars directly
+            BLOCK_M=self.BLOCK_M, BLOCK_N=self.BLOCK_N, BLOCK_K=self.BLOCK_K,
+            GROUP_M=self.GROUP_M, NUM_XCDS=32,
+            num_stages=self.num_stages, num_warps=self.num_warps,
+            matrix_instr_nonkdim=16,
+        )
+        return out
+```
+
+### Option 2: Using autotune with scalar params (Alternative)
+If using @triton.autotune, store scalars in class and use them as constants:
+
+```python
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=8),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def fused_kernel_autotune(
+    a_ptr, b_ptr, c_ptr, M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    multiplier, negative_slope,  # Scalars CAN be passed with autotune
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # Scalars used in kernel
+    acc = acc * multiplier
+    acc = tl.where(acc >= 0, acc, negative_slope * acc)
+```
+
+**IMPORTANT**: When using autotune with scalar params, ensure:
+1. Scalar params come AFTER all tensor params and strides
+2. Scalar params come BEFORE constexpr params
+3. Use single float values, not tensors
 
 ## COMMON ERRORS AND FIXES
 

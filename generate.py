@@ -556,9 +556,73 @@ def extract_code(response: str) -> str:
     return response.strip()
 
 
+def load_optimize_prompt() -> str:
+    """Load the Triton optimization prompt."""
+    script_dir = Path(__file__).parent
+    prompt_path = script_dir / "prompts" / "triton_optimize.txt"
+    
+    if prompt_path.exists():
+        with open(prompt_path) as f:
+            return f.read()
+    
+    # Fallback inline prompt
+    return '''You are an expert Triton kernel optimizer for AMD MI350 GPUs.
+Optimize the given Triton kernel for maximum performance.
+
+Key optimizations to apply:
+1. XCD Swizzle (32 XCDs on MI350) - distributes work across chiplets
+2. L2 Cache Grouping (GROUP_M parameter)
+3. Use matrix_instr_nonkdim=16 for 16x16 MFMA instructions
+4. Precompute grid/strides in __init__, not forward()
+5. Enable TRITON_HIP_USE_BLOCK_PINGPONG and TRITON_HIP_USE_ASYNC_COPY
+
+Output ONLY the optimized Python code in ```python ... ``` block.
+'''
+
+
+def build_optimize_prompt(code: str, feedback: str = None, new_class_name: str = None) -> str:
+    """Build user prompt for optimization with optional feedback."""
+    prompt = f'''**Triton Kernel to Optimize:**
+```python
+{code}
+```
+
+Please optimize this Triton kernel for AMD MI350 (gfx950) GPU.
+Apply all missing MI350 optimizations and return the complete optimized code.
+'''
+    
+    # Specify new class name if provided
+    if new_class_name:
+        prompt += f'''
+**IMPORTANT: Name the optimized model class `{new_class_name}`** (not ModelNew).
+'''
+    
+    if feedback:
+        prompt += f'''
+
+**IMPORTANT - Feedback from Profiler/Evaluation:**
+{feedback}
+
+Please address the issues mentioned above and generate improved code.
+'''
+    
+    return prompt
+
+
+def rename_class_in_code(code: str, old_name: str, new_name: str) -> str:
+    """Rename a class in the generated code."""
+    import re
+    # Replace class definition
+    code = re.sub(rf'\bclass\s+{old_name}\s*\(', f'class {new_name}(', code)
+    # Replace any references to the class
+    code = re.sub(rf'\b{old_name}\s*\(', f'{new_name}(', code)
+    return code
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate HipKittens/Triton kernel from KernelBench problem")
-    parser.add_argument("--problem", required=True, help="Path to KernelBench problem file")
+    parser.add_argument("--problem", default=None, help="Path to KernelBench problem file")
+    parser.add_argument("--optimize", default=None, help="Path to Triton code file to optimize (alternative mode)")
     parser.add_argument("--output", required=True, help="Output file path for generated code")
     parser.add_argument("--prompt", default=None, help="Path to system prompt file (optional)")
     parser.add_argument("--response-file", default=None, help="Save full LLM response to this file")
@@ -569,7 +633,67 @@ def main():
                         help="Base temperature for LLM sampling (default: 0.1)")
     parser.add_argument("--backend", choices=BACKENDS, default="hip",
                         help="Backend type: 'hip' for HipKittens, 'triton' for Triton (default: hip)")
+    parser.add_argument("--feedback", default=None, help="Feedback from previous optimization attempt")
+    parser.add_argument("--new-class-name", default=None, help="Name for the new generated model class")
     args = parser.parse_args()
+    
+    # Validate arguments
+    if not args.problem and not args.optimize:
+        print("Error: Either --problem or --optimize must be specified")
+        sys.exit(1)
+    
+    # Handle optimization mode
+    if args.optimize:
+        print(f"Optimization mode: {args.optimize}")
+        if args.feedback:
+            print(f"With feedback: {args.feedback[:100]}...")
+        if args.new_class_name:
+            print(f"New class name: {args.new_class_name}")
+        
+        # Check LLM_GATEWAY_KEY
+        if not os.environ.get("LLM_GATEWAY_KEY"):
+            print("Error: LLM_GATEWAY_KEY environment variable not set")
+            sys.exit(1)
+        
+        # Load code to optimize
+        with open(args.optimize) as f:
+            code_to_optimize = f.read()
+        
+        # Load optimization prompt
+        system_prompt = load_optimize_prompt()
+        user_prompt = build_optimize_prompt(
+            code_to_optimize, 
+            feedback=args.feedback,
+            new_class_name=args.new_class_name
+        )
+        
+        # Ensure output directory exists
+        output_dir = os.path.dirname(os.path.abspath(args.output))
+        os.makedirs(output_dir, exist_ok=True)
+        
+        print("Calling LLM for optimization...")
+        response = call_llm(system_prompt, user_prompt, temperature=args.temperature)
+        
+        # Save response if requested
+        if args.response_file:
+            with open(args.response_file, 'w') as f:
+                f.write(response)
+            print(f"Full response saved to: {args.response_file}")
+        
+        # Extract and save optimized code
+        optimized_code = extract_code(response)
+        
+        # Ensure the class name is correct (LLM might still use ModelNew)
+        if args.new_class_name:
+            # Replace ModelNew with the requested class name
+            optimized_code = rename_class_in_code(optimized_code, 'ModelNew', args.new_class_name)
+        
+        with open(args.output, 'w') as f:
+            f.write(optimized_code)
+        
+        print(f"Optimized code saved to: {args.output}")
+        print(f"Code length: {len(optimized_code)} characters")
+        return
     
     # Load problem
     print(f"Loading problem: {args.problem}")

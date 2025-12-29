@@ -26,15 +26,45 @@ import torch.nn as nn
 BACKENDS = ["hip", "triton"]
 
 
-def load_problem_module(problem_path: str):
-    """Load reference model from problem file."""
+def load_problem_module(problem_path: str, use_importlib: bool = False):
+    """Load reference model from problem file.
+    
+    Args:
+        problem_path: Path to the problem file
+        use_importlib: If True, use importlib (required if file contains @triton.jit)
+    """
+    # Check if file contains Triton JIT code
     with open(problem_path) as f:
         code = f.read()
     
-    exec_globals = {'torch': torch, 'nn': nn}
-    exec(code, exec_globals)
+    has_triton = '@triton' in code or 'triton.jit' in code
     
-    return exec_globals
+    if has_triton or use_importlib:
+        # Use importlib for Triton code
+        import importlib.util
+        import uuid
+        
+        module_name = f"problem_{uuid.uuid4().hex[:8]}"
+        spec = importlib.util.spec_from_file_location(module_name, problem_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load module from {problem_path}")
+        
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        
+        try:
+            spec.loader.exec_module(module)
+        except Exception as e:
+            if module_name in sys.modules:
+                del sys.modules[module_name]
+            raise
+        
+        return {k: getattr(module, k) for k in dir(module) if not k.startswith('_')}
+    else:
+        # Use exec for simple PyTorch code
+        exec_globals = {'torch': torch, 'nn': nn}
+        exec(code, exec_globals)
+        return exec_globals
 
 
 def load_generated_code(code_path: str, backend: str = "hip"):
@@ -339,7 +369,84 @@ with torch.no_grad():
     return perf_info
 
 
-def evaluate(problem_path: str, code_path: str, run_profiler: bool = False, backend: str = "hip") -> dict:
+def build_profiler_feedback(eval_result: dict, perf_info: dict) -> str:
+    """Build detailed feedback from profiler results for optimization."""
+    feedback_parts = []
+    
+    # Performance summary
+    feedback_parts.append("=== CURRENT KERNEL PERFORMANCE ===")
+    feedback_parts.append(f"Ref Time: {eval_result.get('ref_time_ms', 0):.3f}ms")
+    feedback_parts.append(f"New Time: {eval_result.get('new_time_ms', 0):.3f}ms")
+    feedback_parts.append(f"Current Speedup: {eval_result.get('speedup', 0):.2f}x")
+    
+    # Profiler metrics
+    if perf_info.get("kernel_name"):
+        feedback_parts.append(f"\n=== PROFILER METRICS ===")
+        feedback_parts.append(f"Kernel: {perf_info['kernel_name'][:60]}")
+        
+    if perf_info.get("avg_duration_us", 0) > 0:
+        feedback_parts.append(f"Avg kernel time: {perf_info['avg_duration_us']:.1f}us")
+    
+    if perf_info.get("lds_usage_bytes", 0) > 0:
+        lds_kb = perf_info['lds_usage_bytes'] / 1024
+        feedback_parts.append(f"LDS Usage: {lds_kb:.1f}KB")
+        if lds_kb > 48:
+            feedback_parts.append("  ⚠️ HIGH LDS - may limit occupancy")
+    
+    if perf_info.get("workgroup_size"):
+        wg = perf_info['workgroup_size']
+        feedback_parts.append(f"Workgroup: {wg[0]}x{wg[1]}x{wg[2]}")
+        total_threads = wg[0] * wg[1] * wg[2] if len(wg) == 3 else 0
+        if total_threads > 0 and total_threads < 256:
+            feedback_parts.append("  ⚠️ SMALL WORKGROUP - consider larger blocks")
+    
+    if perf_info.get("grid_size"):
+        grid = perf_info['grid_size']
+        feedback_parts.append(f"Grid: {grid[0]}x{grid[1]}x{grid[2]}")
+    
+    # Optimization hints from profiler
+    hints = perf_info.get("optimization_hints", [])
+    if hints:
+        feedback_parts.append(f"\n=== PROFILER HINTS ===")
+        for hint in hints:
+            feedback_parts.append(f"- {hint}")
+    
+    # MI350-specific recommendations based on metrics
+    feedback_parts.append(f"\n=== MI350 OPTIMIZATION CHECKLIST ===")
+    speedup = eval_result.get('speedup', 0)
+    
+    if speedup < 1.0:
+        feedback_parts.append("Target: Achieve >= 1.0x speedup")
+        feedback_parts.append("")
+        feedback_parts.append("1. XCD Swizzle (32 XCDs on MI350):")
+        feedback_parts.append("   - Add NUM_XCDS = 32 parameter")
+        feedback_parts.append("   - Remap pid: xcd_id = pid % NUM_XCDS; local_pid = pid // NUM_XCDS")
+        feedback_parts.append("")
+        feedback_parts.append("2. L2 Cache Grouping:")
+        feedback_parts.append("   - Add GROUP_M parameter (typically 8)")
+        feedback_parts.append("   - Group tiles to improve L2 hit rate")
+        feedback_parts.append("")
+        feedback_parts.append("3. MFMA Configuration:")
+        feedback_parts.append("   - Use matrix_instr_nonkdim=16 for 16x16 MFMA")
+        feedback_parts.append("   - Optimal block sizes: 128x128x64 or 256x128x64")
+        feedback_parts.append("")
+        feedback_parts.append("4. Environment Variables:")
+        feedback_parts.append("   - os.environ['TRITON_HIP_USE_BLOCK_PINGPONG'] = '1'")
+        feedback_parts.append("   - os.environ['TRITON_HIP_USE_ASYNC_COPY'] = '1'")
+        feedback_parts.append("")
+        feedback_parts.append("5. Launch Overhead:")
+        feedback_parts.append("   - Precompute grid, strides, output buffer in __init__")
+        feedback_parts.append("   - Avoid recomputing in forward()")
+    else:
+        feedback_parts.append(f"✓ Good performance ({speedup:.2f}x speedup)")
+        if speedup < 1.5:
+            feedback_parts.append("Consider fine-tuning block sizes or prefetching")
+    
+    return "\n".join(feedback_parts)
+
+
+def evaluate(problem_path: str, code_path: str, run_profiler: bool = False, backend: str = "hip",
+             ref_class_name: str = "Model", new_class_name: str = "ModelNew") -> dict:
     """Evaluate generated code against reference.
     
     Args:
@@ -347,11 +454,15 @@ def evaluate(problem_path: str, code_path: str, run_profiler: bool = False, back
         code_path: Path to generated code file
         run_profiler: Whether to run rocprof analysis
         backend: Backend type ('hip' or 'triton')
+        ref_class_name: Name of the reference model class (default: Model)
+        new_class_name: Name of the new/generated model class (default: ModelNew)
     """
     result = {
         "problem": Path(problem_path).stem,
         "code_path": code_path,
         "backend": backend,
+        "ref_class_name": ref_class_name,
+        "new_class_name": new_class_name,
         "compile_success": False,
         "accuracy_pass": False,
         "max_diff": float('inf'),
@@ -362,6 +473,7 @@ def evaluate(problem_path: str, code_path: str, run_profiler: bool = False, back
         "new_time_ms": 0.0,
         "speedup": 0.0,
         "perf_analysis": "",
+        "profiler_feedback": "",
         "error": None
     }
     
@@ -370,12 +482,17 @@ def evaluate(problem_path: str, code_path: str, run_profiler: bool = False, back
         print(f"Loading problem: {problem_path}")
         ref_module = load_problem_module(problem_path)
         
-        Model = ref_module.get('Model')
+        # Try to find the reference class by name
+        Model = ref_module.get(ref_class_name)
         get_inputs = ref_module.get('get_inputs')
         get_init_inputs = ref_module.get('get_init_inputs')
         
+        if not Model:
+            # Fallback: try 'Model' as default
+            Model = ref_module.get('Model')
+        
         if not Model or not get_inputs:
-            result["error"] = "Problem file missing Model or get_inputs"
+            result["error"] = f"Problem file missing {ref_class_name}/Model or get_inputs"
             return result
         
         # Load generated code
@@ -394,9 +511,13 @@ def evaluate(problem_path: str, code_path: str, run_profiler: bool = False, back
             result["error"] = f"Compile error: {error_excerpt}"
             return result
         
-        ModelNew = gen_module.get('ModelNew')
+        # Try to find the new class by name
+        ModelNew = gen_module.get(new_class_name)
         if not ModelNew:
-            result["error"] = "Generated code missing ModelNew class"
+            # Fallback: try 'ModelNew' as default
+            ModelNew = gen_module.get('ModelNew')
+        if not ModelNew:
+            result["error"] = f"Generated code missing {new_class_name}/ModelNew class"
             return result
         
         # Create models
@@ -522,8 +643,11 @@ def evaluate(problem_path: str, code_path: str, run_profiler: bool = False, back
                     result["rocprof_metrics"] = {
                         "kernel_name": perf_info.get("kernel_name"),
                         "duration_ms": perf_info.get("duration_ms", 0),
-                        "l2_cache_hit_rate": perf_info.get("l2_cache_hit_rate", 0),
-                        "mfma_utilization_pct": perf_info.get("mfma_utilization_pct", 0),
+                        "avg_duration_us": perf_info.get("avg_duration_us", 0),
+                        "total_calls": perf_info.get("total_calls", 0),
+                        "lds_usage_bytes": perf_info.get("lds_usage_bytes", 0),
+                        "workgroup_size": perf_info.get("workgroup_size", []),
+                        "grid_size": perf_info.get("grid_size", []),
                         "optimization_hints": perf_info.get("optimization_hints", []),
                         "raw_metrics": perf_info.get("raw_metrics", {})
                     }
@@ -533,6 +657,9 @@ def evaluate(problem_path: str, code_path: str, run_profiler: bool = False, back
                         print(f"Optimization hints:")
                         for hint in perf_info["optimization_hints"]:
                             print(f"  - {hint}")
+                    
+                    # Build profiler feedback for optimization
+                    result["profiler_feedback"] = build_profiler_feedback(result, perf_info)
                 except Exception as e:
                     result["perf_analysis"] = f"Profiler error: {str(e)[:100]}"
         
@@ -550,9 +677,12 @@ def main():
     parser.add_argument("--profile", action="store_true", help="Run rocprof analysis for slow kernels")
     parser.add_argument("--backend", choices=BACKENDS, default="hip",
                         help="Backend type: 'hip' for HipKittens, 'triton' for Triton (default: hip)")
+    parser.add_argument("--ref-class", default="Model", help="Reference model class name (default: Model)")
+    parser.add_argument("--new-class", default="ModelNew", help="Generated model class name (default: ModelNew)")
     args = parser.parse_args()
     
-    result = evaluate(args.problem, args.code, run_profiler=args.profile, backend=args.backend)
+    result = evaluate(args.problem, args.code, run_profiler=args.profile, backend=args.backend,
+                     ref_class_name=args.ref_class, new_class_name=args.new_class)
     
     # Print summary
     print("\n" + "=" * 60)

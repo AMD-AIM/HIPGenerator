@@ -1,0 +1,153 @@
+{
+  "name": "hip-triton-generator",
+  "displayName": "HIP/Triton Generator",
+  "description": "Generate optimized Triton/HIP kernels from PyTorch code using LLM",
+  "version": "0.1.0",
+  "publisher": "amd",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Machine Learning",
+    "Other"
+  ],
+  "keywords": [
+    "triton",
+    "hip",
+    "amd",
+    "gpu",
+    "kernel",
+    "pytorch",
+    "rocm"
+  ],
+  "activationEvents": [
+    "onLanguage:python"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "hipGenerator.generateTriton",
+        "title": "Generate Triton Kernel",
+        "category": "HIP Generator"
+      },
+      {
+        "command": "hipGenerator.generateHip",
+        "title": "Generate HIP Kernel",
+        "category": "HIP Generator"
+      },
+      {
+        "command": "hipGenerator.optimizeTriton",
+        "title": "Optimize Triton Kernel",
+        "category": "HIP Generator"
+      },
+      {
+        "command": "hipGenerator.openPanel",
+        "title": "Open Generator Panel",
+        "category": "HIP Generator"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "when": "editorHasSelection && resourceLangId == python",
+          "command": "hipGenerator.generateTriton",
+          "group": "hipGenerator@1"
+        },
+        {
+          "when": "editorHasSelection && resourceLangId == python",
+          "command": "hipGenerator.generateHip",
+          "group": "hipGenerator@2"
+        },
+        {
+          "when": "editorHasSelection && resourceLangId == python",
+          "command": "hipGenerator.optimizeTriton",
+          "group": "hipGenerator@3"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "HIP/Triton Generator",
+      "properties": {
+        "hipGenerator.amdApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "AMD LLM Gateway API Key (LLM_GATEWAY_KEY)",
+          "scope": "application"
+        },
+        "hipGenerator.defaultBackend": {
+          "type": "string",
+          "enum": ["triton", "hip"],
+          "default": "triton",
+          "description": "Default backend for code generation"
+        },
+        "hipGenerator.maxAttempts": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Maximum attempts for generation loop"
+        },
+        "hipGenerator.temperature": {
+          "type": "number",
+          "default": 0.3,
+          "minimum": 0,
+          "maximum": 1,
+          "description": "LLM temperature for code generation"
+        },
+        "hipGenerator.targetSpeedup": {
+          "type": "number",
+          "default": 1.0,
+          "minimum": 0.1,
+          "description": "Target speedup vs PyTorch baseline"
+        },
+        "hipGenerator.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Path to Python interpreter with triton/torch installed"
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "hipGenerator",
+          "title": "HIP Generator",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "hipGenerator": [
+        {
+          "type": "webview",
+          "id": "hipGenerator.mainView",
+          "name": "Generator"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "eslint": "^8.54.0",
+    "typescript": "^5.3.2"
+  },
+  "dependencies": {}
+}
+
+
+
+
+
+
