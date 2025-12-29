@@ -580,6 +580,200 @@ Output ONLY the optimized Python code in ```python ... ``` block.
 '''
 
 
+def build_reflection_prompt(original_prompt: str, generated_code: str, error_message: str, retry_count: int) -> str:
+    """Construct a reflection prompt with error feedback for LLM to retry generation.
+    
+    Args:
+        original_prompt: The original prompt used for generation
+        generated_code: The code that was generated but failed
+        error_message: The error message from compilation or correctness check
+        retry_count: Current retry attempt number
+    
+    Returns:
+        A new prompt that includes the original request, previous attempt, and error feedback
+    """
+    reflection_prompt = f"""The previous attempt to generate the kernel failed. Here is the feedback:
+
+ORIGINAL REQUEST:
+{original_prompt}
+
+PREVIOUS GENERATED CODE (Attempt #{retry_count}):
+```python
+{generated_code}
+```
+
+ERROR MESSAGE:
+{error_message}
+
+Please analyze the error and generate a corrected version of the kernel that fixes the issues mentioned above. Make sure to:
+1. Carefully read the error message and understand what went wrong
+2. Fix the compilation errors or correctness issues
+3. Generate complete, working code that passes all tests
+4. Follow the same requirements from the original request
+
+Generate the corrected kernel code:"""
+    
+    return reflection_prompt
+
+
+def build_optimization_prompt(original_prompt: str, ref_code: str, custom_kernel: str, speedup: float, retry_count: int) -> str:
+    """Construct an optimization prompt when the generated kernel is slower than reference.
+    
+    Args:
+        original_prompt: The original prompt used for generation
+        ref_code: The reference implementation code
+        custom_kernel: The generated kernel code that is correct but slow
+        speedup: The speedup ratio (< 1.0 means slower than reference)
+        retry_count: Current retry attempt number
+    
+    Returns:
+        A new prompt that asks LLM to optimize the kernel for better performance
+    """
+    # Detect if this is an element-wise operation
+    is_elementwise = any(op in ref_code.lower() for op in [
+        'sigmoid', 'relu', 'gelu', 'tanh', 'swish', 'silu', 'softplus',
+        'leaky_relu', 'elu', 'selu', 'mish', 'hardswish', 'hardsigmoid'
+    ]) or ('* x' in ref_code and 'mm(' not in ref_code and 'matmul' not in ref_code)
+    
+    is_gemm = any(op in ref_code.lower() for op in [
+        'mm(', 'matmul(', 'bmm(', 'linear(', 'nn.linear'
+    ])
+    
+    if is_elementwise and not is_gemm:
+        optimization_hints = """
+For element-wise Triton kernels (activation functions, etc.) on AMD MI350:
+
+**CRITICAL: Do NOT use internal loops for element-wise operations!**
+This is a common mistake that destroys performance.
+
+**WRONG (EXTREMELY SLOW)**:
+```python
+for i in range(0, BLOCK_SIZE, 8):  # Don't do this!
+    offsets = block_start + i + tl.arange(0, 8)
+    x = tl.load(x_ptr + offsets, mask=mask)
+```
+
+**CORRECT (FAST)**:
+```python
+# Process entire block at once - no internal loop!
+offsets = block_start + tl.arange(0, BLOCK_SIZE)
+mask = offsets < n_elements
+x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+y = operation(x)  # Apply operation
+tl.store(output_ptr + offsets, y, mask=mask)
+```
+
+**Element-wise optimization strategies:**
+1. Use larger BLOCK_SIZE (1024-2048) for better memory throughput
+2. Use float32 for computation, convert back for storage
+3. Precompute grid size in __init__ to reduce launch overhead
+4. Use preallocated output buffer if input size is fixed
+5. Do NOT use XCD swizzle - it's only for GEMM operations!
+6. Ensure coalesced memory access (sequential threads access sequential memory)
+
+**Enable MI350 optimizations:**
+```python
+os.environ['TRITON_HIP_USE_BLOCK_PINGPONG'] = '1'
+os.environ['TRITON_HIP_USE_ASYNC_COPY'] = '1'
+```"""
+    else:
+        optimization_hints = """
+For Triton kernels on AMD MI350 (gfx950), apply these optimization strategies:
+
+1. **XCD Swizzle (CRITICAL for MI350)**: MI350 has 32 XCDs (chiplets). Use this pattern:
+```python
+NUM_XCDS = 32
+pid = tl.program_id(0)
+num_pids = tl.cdiv(M, BLOCK_M) * tl.cdiv(N, BLOCK_N)
+pids_per_xcd = (num_pids + NUM_XCDS - 1) // NUM_XCDS
+xcd_id = pid % NUM_XCDS
+local_pid = pid // NUM_XCDS
+new_pid = xcd_id * pids_per_xcd + local_pid
+```
+
+2. **L2 Cache Grouping**: Use GROUP_M parameter for better L2 cache reuse:
+```python
+num_pid_m = tl.cdiv(M, BLOCK_M)
+num_pid_n = tl.cdiv(N, BLOCK_N)
+num_pid_in_group = GROUP_M * num_pid_n
+group_id = pid // num_pid_in_group
+first_pid_m = group_id * GROUP_M
+group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+pid_n = (pid % num_pid_in_group) // group_size_m
+```
+
+3. **MFMA Instructions**: Use matrix_instr_nonkdim=16 for 16x16 MFMA on MI350:
+```python
+kernel[grid](... , num_warps=8, matrix_instr_nonkdim=16)
+```
+
+4. **Launch Overhead Elimination**: Precompute in __init__, not forward():
+```python
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Precompute constants
+        self.M, self.N, self.K = 4096, 4096, 4096
+        # Precompute grid
+        self._grid = lambda meta: (triton.cdiv(self.M, meta['BLOCK_M']) * triton.cdiv(self.N, meta['BLOCK_N']),)
+```
+
+5. **Environment Variables**: Set these for optimal MI350 performance:
+```python
+os.environ['TRITON_HIP_USE_BLOCK_PINGPONG'] = '1'
+os.environ['TRITON_HIP_USE_ASYNC_COPY'] = '1'
+```
+
+6. **@triton.autotune** for block sizes: Use configs optimized for MI350:
+```python
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=4),
+    ],
+    key=['M', 'N', 'K'],
+)
+```
+
+7. **Vectorized Memory Access**: Use appropriate vector widths for bf16/fp16."""
+
+    optimization_prompt = f"""The previous kernel generation was CORRECT but too SLOW (speedup: {speedup:.3f}x, meaning it's {1/speedup:.2f}x slower than reference). 
+We need to optimize it for better performance.
+
+ORIGINAL REQUEST:
+{original_prompt}
+
+REFERENCE IMPLEMENTATION:
+```python
+{ref_code}
+```
+
+CURRENT GENERATED KERNEL (Attempt #{retry_count}, Correct but Slow):
+```python
+{custom_kernel}
+```
+
+PERFORMANCE ISSUE:
+The kernel is functionally correct but achieves only {speedup:.3f}x speedup (current runtime is {1/speedup:.2f}x SLOWER than reference).
+We need speedup > 1.0x to be faster than the reference implementation.
+
+{optimization_hints}
+
+Please analyze the performance bottleneck and generate an OPTIMIZED version that:
+1. Maintains correctness (passes all tests)
+2. Achieves speedup > 1.0x (faster than reference)
+3. Implements the optimization strategies mentioned above
+4. Uses hardware-specific optimizations for AMD MI350
+
+You MUST guarantee the correctness of ModelNew. Do NOT cheat by simplifying logic or skipping computations. Do NOT directly and totally use PyTorch native operators to implement the forward function.
+
+Generate the optimized kernel code:"""
+    
+    return optimization_prompt
+
+
 def build_optimize_prompt(code: str, feedback: str = None, new_class_name: str = None) -> str:
     """Build user prompt for optimization with optional feedback."""
     prompt = f'''**Triton Kernel to Optimize:**
@@ -635,12 +829,100 @@ def main():
                         help="Backend type: 'hip' for HipKittens, 'triton' for Triton (default: hip)")
     parser.add_argument("--feedback", default=None, help="Feedback from previous optimization attempt")
     parser.add_argument("--new-class-name", default=None, help="Name for the new generated model class")
+    # Retry mode arguments (for reflection/optimization loop)
+    parser.add_argument("--retry-mode", choices=["reflection", "optimization"], default=None,
+                        help="Retry mode: 'reflection' for error feedback, 'optimization' for perf improvement")
+    parser.add_argument("--prev-code", default=None, help="Path to previous generated code (for retry)")
+    parser.add_argument("--ref-code", default=None, help="Path to reference code (for optimization)")
+    parser.add_argument("--error-msg", default=None, help="Error message from previous attempt (for reflection)")
+    parser.add_argument("--speedup", type=float, default=None, help="Previous speedup value (for optimization)")
+    parser.add_argument("--attempt", type=int, default=1, help="Current attempt number")
     args = parser.parse_args()
     
     # Validate arguments
-    if not args.problem and not args.optimize:
-        print("Error: Either --problem or --optimize must be specified")
+    if not args.problem and not args.optimize and not args.retry_mode:
+        print("Error: Either --problem, --optimize, or --retry-mode must be specified")
         sys.exit(1)
+    
+    # Handle retry mode (reflection or optimization)
+    if args.retry_mode:
+        print(f"Retry mode: {args.retry_mode} (attempt #{args.attempt})")
+        
+        # Check LLM_GATEWAY_KEY
+        if not os.environ.get("LLM_GATEWAY_KEY"):
+            print("Error: LLM_GATEWAY_KEY environment variable not set")
+            sys.exit(1)
+        
+        # Load required files
+        if not args.prev_code or not args.problem:
+            print("Error: --prev-code and --problem are required for retry mode")
+            sys.exit(1)
+        
+        with open(args.prev_code) as f:
+            prev_code = f.read()
+        
+        with open(args.problem) as f:
+            problem_code = f.read()
+        
+        # Build the appropriate prompt based on retry mode
+        if args.retry_mode == "reflection":
+            # Reflection mode: fix errors
+            error_msg = args.error_msg or "Unknown error"
+            print(f"  Error to fix: {error_msg[:100]}...")
+            
+            # Load base system prompt
+            problem_name = os.path.basename(args.problem)
+            system_prompt = load_prompt(args.prompt, problem_name, backend=args.backend)
+            
+            # Build reflection prompt
+            original_prompt = f"Generate a Triton kernel for the following PyTorch code:\n```python\n{problem_code}\n```"
+            user_prompt = build_reflection_prompt(original_prompt, prev_code, error_msg, args.attempt)
+            
+        else:  # optimization mode
+            # Optimization mode: improve performance
+            speedup = args.speedup or 0.5
+            print(f"  Current speedup: {speedup:.3f}x (target: >= 1.0x)")
+            
+            # Load ref code if provided, otherwise use problem code
+            if args.ref_code:
+                with open(args.ref_code) as f:
+                    ref_code = f.read()
+            else:
+                ref_code = problem_code
+            
+            # Load optimization system prompt
+            system_prompt = load_optimize_prompt()
+            
+            # Build optimization prompt
+            original_prompt = f"Generate a Triton kernel for the following PyTorch code:\n```python\n{problem_code}\n```"
+            user_prompt = build_optimization_prompt(original_prompt, ref_code, prev_code, speedup, args.attempt)
+        
+        # Ensure output directory exists
+        output_dir = os.path.dirname(os.path.abspath(args.output))
+        os.makedirs(output_dir, exist_ok=True)
+        
+        print(f"Calling LLM for {args.retry_mode}...")
+        response = call_llm(system_prompt, user_prompt, temperature=args.temperature)
+        
+        # Save response if requested
+        if args.response_file:
+            with open(args.response_file, 'w') as f:
+                f.write(response)
+            print(f"Full response saved to: {args.response_file}")
+        
+        # Extract and save code
+        generated_code = extract_code(response)
+        
+        # Ensure the class name is correct
+        if args.new_class_name:
+            generated_code = rename_class_in_code(generated_code, 'ModelNew', args.new_class_name)
+        
+        with open(args.output, 'w') as f:
+            f.write(generated_code)
+        
+        print(f"Generated code saved to: {args.output}")
+        print(f"Code length: {len(generated_code)} characters")
+        return
     
     # Handle optimization mode
     if args.optimize:

@@ -91,11 +91,39 @@ class ModelNew(nn.Module):
 - Fuse operations (bias add, activation) after main computation loop
 - Avoid redundant computations inside loops
 
+## IMPORTANT: AVOID THESE COMMON MISTAKES
+
+### NEVER use internal loops for element-wise operations!
+**WRONG (SLOW)**:
+```python
+# This is EXTREMELY SLOW - don't do this!
+for i in range(0, BLOCK_SIZE, 8):
+    offsets = block_start + i + tl.arange(0, 8)
+    x = tl.load(x_ptr + offsets, mask=mask)
+    ...
+```
+
+**CORRECT (FAST)**:
+```python
+# Process entire block at once
+offsets = block_start + tl.arange(0, BLOCK_SIZE)
+mask = offsets < n_elements
+x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+y = operation(x)
+tl.store(output_ptr + offsets, y, mask=mask)
+```
+
+### XCD Swizzle is ONLY for GEMM/MATMUL operations!
+- For element-wise ops (ReLU, Swish, GELU, etc.), XCD swizzle is NOT needed
+- XCD swizzle only helps when there's spatial locality (2D tile access patterns)
+- Element-wise ops are memory-bound, not compute-bound
+
 ## COMMON PERFORMANCE ISSUES TO FIX
 
-### Issue 1: Missing XCD Swizzle
-**Symptom**: Speedup is 0.3-0.5x
-**Fix**: Add the XCD swizzle pattern shown above
+### Issue 1: Missing XCD Swizzle (GEMM only)
+**Symptom**: Speedup is 0.3-0.5x for GEMM/matmul operations
+**Fix**: Add the XCD swizzle pattern shown above (only for GEMM)
+**Note**: Do NOT add XCD swizzle to element-wise operations!
 
 ### Issue 2: Using Python min() instead of tl.minimum()
 **Symptom**: Runtime error in JIT kernel

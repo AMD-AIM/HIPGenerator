@@ -2,6 +2,16 @@
 
 LLM-based HipKittens/Triton kernel generator for AMD GPUs, targeting KernelBench GEMM problems.
 
+## VSCode Extension
+
+A VSCode extension is available for interactive kernel generation. See [`vscode-extension/README.md`](vscode-extension/README.md) for details.
+
+```bash
+# Quick install
+cd vscode-extension
+./install.sh
+```
+
 ## Quick Start
 
 ```bash

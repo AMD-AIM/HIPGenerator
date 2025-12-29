@@ -112,6 +112,11 @@ export class PythonBackend {
         let bestEval: EvaluationResult | undefined;
         let lastError: string | undefined;
 
+        // Track state for retry logic
+        let prevCodeFile: string | undefined;
+        let prevEvalResult: EvaluationResult | undefined;
+        let retryMode: 'reflection' | 'optimization' | undefined;
+
         try {
             for (let attempt = 1; attempt <= maxAttempts; attempt++) {
                 progress.report({ 
@@ -121,17 +126,54 @@ export class PythonBackend {
 
                 this._outputChannel.appendLine(`\n--- Attempt ${attempt}/${maxAttempts} ---`);
 
-                // Generate code
                 const outputFile = path.join(outputDir, `code_${attempt}.py`);
-                const generateResult = await this._runGenerate(
-                    pythonPath,
-                    hipGeneratorPath,
-                    problemFile,
-                    outputFile,
-                    request.backend,
-                    apiKey,
-                    config.get<number>('temperature') || 0.3
-                );
+                let generateResult: { success: boolean; error?: string };
+
+                // First attempt: normal generation; subsequent: use retry mode
+                if (attempt === 1) {
+                    // Initial generation
+                    generateResult = await this._runGenerate(
+                        pythonPath,
+                        hipGeneratorPath,
+                        problemFile,
+                        outputFile,
+                        request.backend,
+                        apiKey,
+                        config.get<number>('temperature') || 0.3
+                    );
+                } else if (prevCodeFile && retryMode) {
+                    // Retry with reflection or optimization
+                    this._outputChannel.appendLine(`Using ${retryMode} mode for retry`);
+                    
+                    generateResult = await this._runRetry(
+                        pythonPath,
+                        hipGeneratorPath,
+                        problemFile,
+                        prevCodeFile,
+                        outputFile,
+                        request.backend,
+                        apiKey,
+                        config.get<number>('temperature') || 0.3,
+                        retryMode,
+                        attempt,
+                        {
+                            errorMsg: lastError,
+                            speedup: prevEvalResult?.speedup,
+                            refCodeFile: problemFile  // Use problem file as reference
+                        }
+                    );
+                } else {
+                    // Fallback to normal generation
+                    generateResult = await this._runGenerate(
+                        pythonPath,
+                        hipGeneratorPath,
+                        problemFile,
+                        outputFile,
+                        request.backend,
+                        apiKey,
+                        config.get<number>('temperature') || 0.3
+                    );
+                }
 
                 if (!generateResult.success || !fs.existsSync(outputFile)) {
                     lastError = generateResult.error || 'Generation failed';
@@ -140,11 +182,14 @@ export class PythonBackend {
                         message: `Attempt ${attempt}/${maxAttempts}: Generation failed, retrying...`,
                         increment: 100 / maxAttempts / 2
                     });
+                    // Use reflection mode for next attempt
+                    retryMode = 'reflection';
                     continue;
                 }
 
                 const generatedCode = fs.readFileSync(outputFile, 'utf-8');
                 this._outputChannel.appendLine(`Generated ${generatedCode.length} chars`);
+                prevCodeFile = outputFile;
 
                 // Evaluate
                 progress.report({ 
@@ -159,6 +204,7 @@ export class PythonBackend {
                     pythonPath,
                     hipGeneratorPath
                 );
+                prevEvalResult = evalResult;
 
                 const statusEmoji = evalResult.compile_success 
                     ? (evalResult.accuracy_pass ? '✓' : '⚠') 
@@ -178,6 +224,26 @@ export class PythonBackend {
                     increment: 100 / maxAttempts / 4
                 });
 
+                // Decide retry mode based on eval result
+                if (!evalResult.compile_success) {
+                    // Compilation failed - use reflection
+                    retryMode = 'reflection';
+                    lastError = evalResult.error || 'Compilation failed';
+                    this._outputChannel.appendLine(`  → Next retry: reflection (compile error)`);
+                } else if (!evalResult.accuracy_pass) {
+                    // Accuracy failed - use reflection
+                    retryMode = 'reflection';
+                    lastError = evalResult.error || 
+                        (evalResult.has_nan ? 'Output contains NaN' : 
+                         evalResult.has_inf ? 'Output contains Inf' : 
+                         `Max diff too high: ${evalResult.max_diff}`);
+                    this._outputChannel.appendLine(`  → Next retry: reflection (accuracy error)`);
+                } else if (evalResult.speedup < 1.0) {
+                    // Correct but slow - use optimization
+                    retryMode = 'optimization';
+                    this._outputChannel.appendLine(`  → Next retry: optimization (speedup=${evalResult.speedup.toFixed(2)}x < 1.0x)`);
+                }
+
                 // Track best result
                 if (evalResult.accuracy_pass) {
                     if (!bestEval || evalResult.speedup > bestEval.speedup) {
@@ -194,10 +260,6 @@ export class PythonBackend {
                     // Keep the code even if accuracy failed (user might want to debug)
                     bestCode = generatedCode;
                     bestEval = evalResult;
-                    lastError = evalResult.error || 
-                        (evalResult.has_nan ? 'Output contains NaN' : 
-                         evalResult.has_inf ? 'Output contains Inf' : 
-                         `Max diff too high: ${evalResult.max_diff}`);
                 }
             }
 
@@ -719,6 +781,60 @@ export class PythonBackend {
             '--num-samples', '1',
             '--temperature', temperature.toString()
         ];
+
+        const result = await this._runPython(pythonPath, args, {
+            LLM_GATEWAY_KEY: apiKey,
+            PYTORCH_ROCM_ARCH: 'gfx950'
+        });
+
+        return {
+            success: result.exitCode === 0,
+            error: result.stderr || undefined
+        };
+    }
+
+    /**
+     * Run generate.py in retry mode (reflection or optimization)
+     */
+    private async _runRetry(
+        pythonPath: string,
+        hipGeneratorPath: string,
+        problemFile: string,
+        prevCodeFile: string,
+        outputFile: string,
+        backend: string,
+        apiKey: string,
+        temperature: number,
+        retryMode: 'reflection' | 'optimization',
+        attempt: number,
+        options: {
+            errorMsg?: string;  // For reflection mode
+            speedup?: number;   // For optimization mode
+            refCodeFile?: string;  // For optimization mode
+        }
+    ): Promise<{ success: boolean; error?: string }> {
+        const generateScript = path.join(hipGeneratorPath, 'generate.py');
+        const args = [
+            generateScript,
+            '--problem', problemFile,
+            '--prev-code', prevCodeFile,
+            '--output', outputFile,
+            '--backend', backend,
+            '--temperature', temperature.toString(),
+            '--retry-mode', retryMode,
+            '--attempt', attempt.toString()
+        ];
+
+        if (retryMode === 'reflection' && options.errorMsg) {
+            args.push('--error-msg', options.errorMsg);
+        } else if (retryMode === 'optimization') {
+            if (options.speedup !== undefined) {
+                args.push('--speedup', options.speedup.toString());
+            }
+            if (options.refCodeFile) {
+                args.push('--ref-code', options.refCodeFile);
+            }
+        }
 
         const result = await this._runPython(pythonPath, args, {
             LLM_GATEWAY_KEY: apiKey,
