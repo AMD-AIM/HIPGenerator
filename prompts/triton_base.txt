@@ -210,3 +210,5 @@ class ModelNew(nn.Module):
 - Include complete ModelNew class matching reference Model interface
 - NO explanations outside code block
 
+
+

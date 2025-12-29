@@ -2,7 +2,7 @@
   "description": "Prompt configuration for HipKittens/Triton kernel generation with adaptive tile sizes",
   
   "default_prompt": "hipkittens_base.txt",
-  "triton_default_prompt": "triton_base.txt",
+  "triton_default_prompt": "triton_gemm_mi350_golden.txt",
   
   "patterns": {
     "matmul|matrix_mult|gemm|mm_|square.*matrix|standard.*matrix": "hipkittens_gemm.txt",
@@ -19,18 +19,19 @@
   },
   
   "triton_patterns": {
-    "matmul|matrix_mult|gemm|mm_|square.*matrix|standard.*matrix": "triton_gemm.txt",
-    "tall.*skinny|skinny|irregular|large_k|small_k": "triton_gemm.txt",
-    "bmm|batched.*matrix|3d.*matrix|4d.*matrix": "triton_gemm.txt",
-    "mv_|matvec|matrix_vector": "triton_gemm.txt",
-    "linear|fc|dense|mlp": "triton_gemm.txt",
-    "gemm.*add|add.*relu|gemm.*relu|gemm.*bias|bias.*relu": "triton_gemm.txt",
-    "relu|sigmoid|tanh|gelu|selu|elu|softplus|softsign|leaky|hard|silu|swish|mish|divide": "triton_gemm.txt",
-    "softmax|logsoftmax": "triton_base.txt",
-    "layernorm|batchnorm|groupnorm|instancenorm|rmsnorm": "triton_base.txt",
-    "norm_|frobenius|l1norm|l2norm": "triton_base.txt",
-    "pool|max_|mean_|sum_|argmax|argmin|min_": "triton_base.txt",
-    "scaling|residual|add": "triton_gemm.txt"
+    "matmul|matrix_mult|gemm|mm_|square.*matrix|standard.*matrix": "triton_gemm_mi350_golden.txt",
+    "tall.*skinny|skinny|irregular|large_k|small_k": "triton_gemm_mi350_golden.txt",
+    "bmm|batched.*matrix|3d.*matrix|4d.*matrix": "triton_gemm_mi350_golden.txt",
+    "mv_|matvec|matrix_vector": "triton_gemm_mi350_golden.txt",
+    "linear|fc|dense|mlp": "triton_gemm_mi350_golden.txt",
+    "gemm.*add|add.*relu|gemm.*relu|gemm.*bias|bias.*relu": "triton_gemm_mi350_golden.txt",
+    "relu|sigmoid|tanh|gelu|selu|elu|softplus|softsign|leaky|hard|silu|swish|mish|divide": "triton_gemm_mi350_golden.txt",
+    "softmax|logsoftmax": "triton_gemm_mi350_golden.txt",
+    "layernorm|batchnorm|groupnorm|instancenorm|rmsnorm": "triton_gemm_mi350_golden.txt",
+    "norm_|frobenius|l1norm|l2norm": "triton_gemm_mi350_golden.txt",
+    "pool|max_|mean_|sum_|argmax|argmin|min_": "triton_gemm_mi350_golden.txt",
+    "scaling|residual|add": "triton_gemm_mi350_golden.txt",
+    "transposed": "triton_gemm_mi350_golden.txt"
   },
   
   "reflection_hints": {
@@ -60,20 +61,35 @@
   },
   
   "triton_reflection_hints": {
-    "PERFORMANCE TOO SLOW": [
-      "Add more autotune configs for different block sizes",
-      "Increase num_stages for better software pipelining",
-      "Try larger num_warps (4-8) for AMD GPUs"
+    "PERFORMANCE TOO SLOW (<0.5x)": [
+      "CRITICAL: Add XCD swizzle for MI350's 32 XCDs - without it you get ~0.3-0.5x!",
+      "Use: pids_per_xcd = (num_pids + 31) // 32; xcd_id = pid % 32; local_pid = pid // 32",
+      "Then: remapped_pid = xcd_id * pids_per_xcd + local_pid",
+      "Set NUM_XCDS = 32 (MI350 has 32 XCDs, NOT 8!)",
+      "Set matrix_instr_nonkdim=16 in kernel launch for 16x16 MFMA"
+    ],
+    "PERFORMANCE MODERATE (0.5x-0.8x)": [
+      "Enable pingpong: os.environ['TRITON_HIP_USE_BLOCK_PINGPONG'] = '1'",
+      "Use optimal block sizes: 256x256x32 for square, 128x128x64 for large K",
+      "Add L2 grouping with GROUP_M=8 to 16",
+      "Use num_stages=2 or 3, num_warps=8"
+    ],
+    "PERFORMANCE CLOSE (0.8x-1.0x)": [
+      "Eliminate launch overhead: precompute grid/strides in __init__",
+      "Preallocate output with register_buffer",
+      "Remove all .stride() calls from forward() - use precomputed values",
+      "Consider removing masks for perfectly aligned dimensions"
     ],
     "Compile error": [
-      "Check Triton kernel signature matches call site",
-      "Ensure tl.constexpr parameters are passed correctly",
-      "Use proper Triton dtypes: tl.bfloat16, tl.float32"
+      "matrix_instr_nonkdim goes in kernel launch, NOT triton.Config()",
+      "Check tl.constexpr parameters are passed correctly at compile time",
+      "Use proper Triton dtypes: tl.float16, tl.bfloat16, tl.float32"
     ],
-    "accuracy.*fail|max diff": [
-      "Use float32 accumulator for better precision",
-      "Check mask logic for boundary handling",
-      "Verify stride calculations for non-contiguous tensors"
+    "accuracy.*fail|max diff|NaN": [
+      "For nn.Linear: weight is [out, in], swap strides to treat as transposed",
+      "Use float32 accumulator: acc = tl.zeros(..., dtype=tl.float32)",
+      "Check mask: k_mask = (k + tl.arange(0, BLOCK_K)) < K, NOT offs_k < K",
+      "NEVER use .T or .trans() inside kernel - handle via stride swapping"
     ]
   },
   
