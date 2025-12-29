@@ -111,6 +111,148 @@ def load_generated_code(code_path: str, backend: str = "hip"):
         return exec_globals
 
 
+def detect_cheating(code_path: str, backend: str = "triton") -> dict:
+    """Detect if generated code is cheating by using PyTorch functions instead of Triton kernels.
+    
+    Returns:
+        dict with:
+            - is_cheating: bool
+            - cheating_reason: str or None
+            - warnings: list of potential issues
+    """
+    with open(code_path, 'r') as f:
+        code = f.read()
+    
+    result = {
+        "is_cheating": False,
+        "cheating_reason": None,
+        "warnings": []
+    }
+    
+    if backend != "triton":
+        return result  # Only check Triton backend for now
+    
+    import re
+    
+    # =====================================================
+    # CHECK 1: Forbidden PyTorch function calls in ModelNew
+    # =====================================================
+    forbidden_torch_patterns = [
+        # Common activation/computation functions (CHEATING if used for main computation)
+        (r'torch\.log_softmax\s*\(', 'torch.log_softmax() - use Triton kernel instead'),
+        (r'torch\.softmax\s*\(', 'torch.softmax() - use Triton kernel instead'),
+        (r'torch\.sigmoid\s*\(', 'torch.sigmoid() - use Triton kernel instead'),
+        (r'torch\.tanh\s*\(', 'torch.tanh() - use Triton kernel instead'),
+        (r'torch\.relu\s*\(', 'torch.relu() - use Triton kernel instead'),
+        (r'torch\.gelu\s*\(', 'torch.gelu() - use Triton kernel instead'),
+        (r'torch\.silu\s*\(', 'torch.silu() - use Triton kernel instead'),
+        (r'torch\.mm\s*\(', 'torch.mm() - use Triton kernel instead'),
+        (r'torch\.matmul\s*\(', 'torch.matmul() - use Triton kernel instead'),
+        (r'torch\.bmm\s*\(', 'torch.bmm() - use Triton kernel instead'),
+        (r'torch\.linear\s*\(', 'torch.linear() - use Triton kernel instead'),
+        (r'torch\.exp\s*\(', 'torch.exp() - use Triton kernel instead'),
+        (r'torch\.log\s*\(', 'torch.log() - use Triton kernel instead'),
+        (r'torch\.sqrt\s*\(', 'torch.sqrt() - use Triton kernel instead'),
+        # Functional API (also forbidden)
+        (r'F\.log_softmax\s*\(', 'F.log_softmax() - use Triton kernel instead'),
+        (r'F\.softmax\s*\(', 'F.softmax() - use Triton kernel instead'),
+        (r'F\.sigmoid\s*\(', 'F.sigmoid() - use Triton kernel instead'),
+        (r'F\.tanh\s*\(', 'F.tanh() - use Triton kernel instead'),
+        (r'F\.relu\s*\(', 'F.relu() - use Triton kernel instead'),
+        (r'F\.gelu\s*\(', 'F.gelu() - use Triton kernel instead'),
+        (r'F\.silu\s*\(', 'F.silu() - use Triton kernel instead'),
+        (r'F\.linear\s*\(', 'F.linear() - use Triton kernel instead'),
+        (r'F\.layer_norm\s*\(', 'F.layer_norm() - use Triton kernel instead'),
+        (r'F\.batch_norm\s*\(', 'F.batch_norm() - use Triton kernel instead'),
+        # nn modules called directly
+        (r'torch\.nn\.functional\.', 'torch.nn.functional.* - use Triton kernel instead'),
+    ]
+    
+    # Extract ModelNew class code ONLY (not Model class which is the reference)
+    # Look for class ModelNew and capture until next class or end of file
+    modelnew_match = re.search(r'class\s+ModelNew[^:]*:\s*\n(.*?)(?=\nclass\s|\Z)', code, re.DOTALL)
+    if modelnew_match:
+        modelnew_code = modelnew_match.group(0)
+        
+        # Check for forbidden patterns only in ModelNew class
+        for pattern, msg in forbidden_torch_patterns:
+            if re.search(pattern, modelnew_code, re.IGNORECASE):
+                result["is_cheating"] = True
+                result["cheating_reason"] = f"CHEATING DETECTED: ModelNew uses {msg}"
+                return result
+    
+    # If no ModelNew class found, skip this check (will fail later anyway)
+    
+    # =====================================================
+    # CHECK 2: Empty or incomplete Triton kernels
+    # =====================================================
+    kernel_pattern = r'@triton\.jit\s*\ndef\s+(\w+)\s*\([^)]*\)\s*:\s*\n(.*?)(?=\n@|\nclass\s|\ndef\s|\Z)'
+    kernels = re.findall(kernel_pattern, code, re.DOTALL)
+    
+    for kernel_name, kernel_body in kernels:
+        # Check if kernel body is essentially empty or just has return
+        stripped_body = kernel_body.strip()
+        lines = [l.strip() for l in stripped_body.split('\n') if l.strip() and not l.strip().startswith('#')]
+        
+        # Count meaningful operations
+        has_tl_load = 'tl.load' in kernel_body
+        has_tl_store = 'tl.store' in kernel_body
+        
+        if len(lines) < 3:  # Too short to be a real kernel
+            result["is_cheating"] = True
+            result["cheating_reason"] = f"CHEATING DETECTED: Kernel '{kernel_name}' has incomplete implementation (< 3 lines)"
+            return result
+        
+        if not has_tl_load and not has_tl_store:
+            result["warnings"].append(f"Kernel '{kernel_name}' has no tl.load or tl.store - may be incomplete")
+    
+    # =====================================================
+    # CHECK 3: Kernel function definition issues
+    # =====================================================
+    # Check for missing closing parenthesis in kernel definitions
+    # This regex looks for @triton.jit followed by def without a complete signature
+    # A proper kernel should have: @triton.jit ... def name(...): with the colon
+    kernel_defs = re.findall(r'@triton\.jit\s*\ndef\s+(\w+)\s*\(([^)]*)\)\s*:', code, re.DOTALL)
+    triton_jit_count = len(re.findall(r'@triton\.jit', code))
+    
+    # If we have @triton.jit decorators but can't find matching function definitions with ):
+    # then the definition might be malformed
+    if triton_jit_count > len(kernel_defs):
+        # Check specifically for incomplete signatures (common LLM mistake)
+        incomplete = re.search(r'@triton\.jit\s*\ndef\s+\w+\s*\([^)]*\n[^)]*[^:\)]\s*\n', code)
+        if incomplete:
+            result["is_cheating"] = True
+            result["cheating_reason"] = "CHEATING DETECTED: Kernel function definition is incomplete (missing closing parenthesis or colon)"
+            return result
+    
+    # =====================================================
+    # CHECK 4: No Triton kernels defined at all
+    # =====================================================
+    if '@triton.jit' not in code and backend == "triton":
+        result["is_cheating"] = True
+        result["cheating_reason"] = "CHEATING DETECTED: No @triton.jit kernel defined - ModelNew must use Triton kernels"
+        return result
+    
+    # =====================================================
+    # CHECK 5: Fallback patterns in ModelNew.forward()
+    # =====================================================
+    # Check for else/return patterns that fallback to PyTorch
+    fallback_patterns = [
+        r'else:\s*\n\s*return\s+torch\.',  # else: return torch.xxx
+        r'return\s+torch\.nn\.functional\.',  # return F.xxx
+        r'except.*:\s*\n\s*return\s+torch\.',  # except: return torch.xxx
+    ]
+    
+    if modelnew_match:
+        for pattern in fallback_patterns:
+            if re.search(pattern, modelnew_code):
+                result["is_cheating"] = True
+                result["cheating_reason"] = "CHEATING DETECTED: ModelNew has PyTorch fallback in forward() - all cases must use Triton"
+                return result
+    
+    return result
+
+
 def benchmark(fn, warmup=10, iterations=100):
     """Benchmark a function."""
     for _ in range(warmup):
@@ -494,6 +636,20 @@ def evaluate(problem_path: str, code_path: str, run_profiler: bool = False, back
         if not Model or not get_inputs:
             result["error"] = f"Problem file missing {ref_class_name}/Model or get_inputs"
             return result
+        
+        # Check for cheating BEFORE loading code
+        print(f"Checking for cheating patterns in: {code_path}")
+        cheat_check = detect_cheating(code_path, backend=backend)
+        if cheat_check["is_cheating"]:
+            result["error"] = cheat_check["cheating_reason"]
+            result["compile_success"] = False
+            result["accuracy_pass"] = False
+            print(f"❌ {cheat_check['cheating_reason']}")
+            return result
+        
+        if cheat_check["warnings"]:
+            for warning in cheat_check["warnings"]:
+                print(f"⚠️ Warning: {warning}")
         
         # Load generated code
         print(f"Loading generated code: {code_path} (backend={backend})")
