@@ -489,119 +489,86 @@ async function handleOptimizeTriton(context: vscode.ExtensionContext) {
 
 /**
  * Extract the relevant generated code (ModelNew class and dependencies)
+ * 
+ * Strategy: Find the first Triton-related line and include everything from there.
+ * This avoids complex parsing that can break multi-line function definitions.
  */
 function extractRelevantCode(generatedCode: string): string {
-    // Find imports that are not already in the original file
     const lines = generatedCode.split('\n');
-    const relevantLines: string[] = [];
-    let inModelNew = false;
-    let braceCount = 0;
-    let foundModelNew = false;
     
+    // Find the start of Triton-related code
+    let startIndex = -1;
     for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        const trimmedLine = line.trim();
+        const trimmed = lines[i].trim();
         
-        // Include triton imports
-        if (trimmedLine.startsWith('import triton') || 
-            trimmedLine.startsWith('from triton') ||
-            trimmedLine.startsWith('import os') && lines[i+1]?.includes('TRITON')) {
-            relevantLines.push(line);
-            continue;
-        }
-        
-        // Include os.environ settings for triton
-        if (trimmedLine.startsWith('os.environ') && 
-            (trimmedLine.includes('TRITON') || trimmedLine.includes('PYTORCH'))) {
-            relevantLines.push(line);
-            continue;
-        }
-        
-        // Include constants like NUM_XCDS
-        if (trimmedLine.match(/^[A-Z_]+\s*=\s*\d+/)) {
-            relevantLines.push(line);
-            continue;
-        }
-        
-        // Include @triton decorators and kernel functions
-        if (trimmedLine.startsWith('@triton')) {
-            // Include the decorator and following function
-            relevantLines.push(line);
-            continue;
-        }
-        
-        // Include triton kernel definitions
-        if (trimmedLine.startsWith('def ') && 
-            (relevantLines.length > 0 && relevantLines[relevantLines.length - 1].trim().startsWith('@triton'))) {
-            relevantLines.push(line);
-            continue;
-        }
-        
-        // Track if we're inside a triton kernel function
-        if (relevantLines.length > 0) {
-            const lastRelevant = relevantLines[relevantLines.length - 1];
-            if (lastRelevant.trim().startsWith('def ') || 
-                (lastRelevant.trim() !== '' && !lastRelevant.trim().startsWith('class '))) {
-                // Continue adding lines until we hit an empty line followed by non-indented code
-                if (line.startsWith('    ') || line.startsWith('\t') || trimmedLine === '') {
-                    relevantLines.push(line);
-                    continue;
-                }
-            }
-        }
-        
-        // Include wrapper functions (usually right before ModelNew)
-        if (trimmedLine.startsWith('def ') && !trimmedLine.includes('get_inputs') && 
-            !trimmedLine.includes('get_init_inputs') && !trimmedLine.includes('__init__')) {
-            // Check if this might be a wrapper function
-            let j = i + 1;
-            let isWrapper = false;
-            while (j < lines.length && (lines[j].startsWith('    ') || lines[j].startsWith('\t') || lines[j].trim() === '')) {
-                if (lines[j].includes('_kernel[') || lines[j].includes('kernel[')) {
-                    isWrapper = true;
-                    break;
-                }
-                j++;
-            }
-            if (isWrapper) {
-                // Include the whole function
-                relevantLines.push(line);
-                i++;
-                while (i < lines.length && (lines[i].startsWith('    ') || lines[i].startsWith('\t') || lines[i].trim() === '')) {
-                    relevantLines.push(lines[i]);
-                    if (lines[i].trim() !== '' && !lines[i].startsWith('    ') && !lines[i].startsWith('\t')) {
-                        break;
-                    }
-                    i++;
-                }
-                i--; // Back up one since the for loop will increment
-                continue;
-            }
-        }
-        
-        // Include ModelNew class
-        if (trimmedLine.startsWith('class ModelNew')) {
-            foundModelNew = true;
-            inModelNew = true;
-            relevantLines.push(line);
-            continue;
-        }
-        
-        // If we're in ModelNew class, keep adding until the class ends
-        if (inModelNew) {
-            relevantLines.push(line);
-            // Track class ending by indentation
-            if (trimmedLine !== '' && !line.startsWith('    ') && !line.startsWith('\t') && 
-                !trimmedLine.startsWith('class ') && !trimmedLine.startsWith('def ')) {
-                inModelNew = false;
-            }
-            continue;
+        // Look for the first Triton-related line
+        if (trimmed.startsWith('import triton') ||
+            trimmed.startsWith('from triton') ||
+            trimmed.startsWith('@triton') ||
+            (trimmed.startsWith('import os') && i + 1 < lines.length && lines[i + 1].includes('TRITON')) ||
+            (trimmed.startsWith('os.environ') && (trimmed.includes('TRITON') || trimmed.includes('PYTORCH'))) ||
+            trimmed.match(/^[A-Z_]+\s*=\s*\d+/) // Constants like NUM_XCDS
+        ) {
+            startIndex = i;
+            break;
         }
     }
     
-    // If we didn't find ModelNew, return the whole generated code
-    if (!foundModelNew) {
+    // If no Triton code found, look for ModelNew class
+    if (startIndex === -1) {
+        for (let i = 0; i < lines.length; i++) {
+            if (lines[i].trim().startsWith('class ModelNew')) {
+                startIndex = i;
+                break;
+            }
+        }
+    }
+    
+    // If still nothing found, return the whole code
+    if (startIndex === -1) {
         return generatedCode;
+    }
+    
+    // Find the end: after ModelNew class or end of file
+    let endIndex = lines.length;
+    let inModelNew = false;
+    let modelNewIndent = 0;
+    
+    for (let i = startIndex; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
+        
+        if (trimmed.startsWith('class ModelNew')) {
+            inModelNew = true;
+            // Get the indentation of the class definition
+            modelNewIndent = line.length - line.trimStart().length;
+        }
+        
+        // Skip get_inputs and get_init_inputs functions (they're from the original problem)
+        if (trimmed.startsWith('def get_inputs') || trimmed.startsWith('def get_init_inputs')) {
+            endIndex = i;
+            break;
+        }
+        
+        // If we were in ModelNew and hit another top-level class/def (not indented), stop there
+        if (inModelNew && i > startIndex && trimmed !== '') {
+            const currentIndent = line.length - line.trimStart().length;
+            if (currentIndent <= modelNewIndent && 
+                !trimmed.startsWith('class ModelNew') &&
+                (trimmed.startsWith('class ') || trimmed.startsWith('def ')) &&
+                !trimmed.startsWith('def __init__') && !trimmed.startsWith('def forward')) {
+                endIndex = i;
+                break;
+            }
+        }
+    }
+    
+    // Extract the relevant portion
+    const relevantLines = lines.slice(startIndex, endIndex);
+    
+    // Clean up: remove trailing empty lines
+    while (relevantLines.length > 0 && relevantLines[relevantLines.length - 1].trim() === '') {
+        relevantLines.pop();
     }
     
     return relevantLines.join('\n');
