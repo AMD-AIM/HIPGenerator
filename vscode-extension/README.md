@@ -1,185 +1,110 @@
-# HIP/Triton Generator - VSCode Extension
+# AMD HIP/Triton Generator
 
-Generate optimized Triton/HIP GPU kernels from PyTorch code using LLM.
+Generate optimized **Triton/HIP GPU kernels** from PyTorch code for AMD Instinct GPUs using LLM.
 
 ## Features
 
-- **Right-click Generate**: Select PyTorch code, right-click, and generate Triton or HIP kernels
-- **Auto-infer Inputs**: Automatically infers `get_inputs()` and `get_init_inputs()` from your code
-- **Interactive Panel**: Modify inferred inputs and regenerate code
-- **Evaluation**: Test generated kernels for correctness and performance
-- **AMD GPU Optimized**: Uses AMD LLM Gateway with optimizations for MI350 GPUs
+- **One-click Generation** — Select PyTorch code, right-click, and generate optimized Triton kernels
+- **Auto Evaluation** — Automatically validates correctness and measures speedup
+- **Multi-attempt Retry** — Retries with error feedback if compilation or tests fail
+- **Triton Optimization** — Optimize existing Triton kernels for better performance
 
 ## Quick Start
 
-### 1. Install Dependencies
+### 1. Configure API Key
 
-```bash
-cd /root/HipGenerator/vscode-extension
-npm install
-npm run compile
-```
+1. Open **Settings** (`Ctrl+,`)
+2. Search for `hipGenerator.amdApiKey`
+3. Enter your AMD LLM Gateway API Key (get one at [llm.amd.com](https://llm.amd.com))
 
-### 2. Configure API Key
-
-1. Open VSCode Settings (Ctrl+,)
-2. Search for "HIP Generator"
-3. Set your AMD API Key in `hipGenerator.amdApiKey`
-
-Or use the command line:
-```bash
-export LLM_GATEWAY_KEY="your_api_key_here"
-```
-
-### 3. Use the Extension
+### 2. Generate a Kernel
 
 1. Open a Python file with PyTorch code
-2. Select the code you want to convert (should include a `Model` class)
-3. Right-click and select "Generate Triton Kernel" or "Generate HIP Kernel"
-4. The generator panel opens with:
-   - Auto-inferred `get_inputs()` and `get_init_inputs()`
-   - Options to modify inputs
-   - Generate, Evaluate, and Save buttons
+2. **Select** the code you want to convert (a `Model` class with `forward` method)
+3. **Right-click** → Select **"Generate Triton Kernel"** or **"Generate HIP Kernel"**
+4. Wait for generation and evaluation
+5. If successful, the generated code is inserted at the end of your file
 
-## Requirements
+### 3. Optimize Existing Triton Code
 
-This extension is designed to run in a Docker container with:
-
-- **ROCm**: AMD GPU drivers and runtime
-- **PyTorch**: With ROCm support
-- **Triton**: For Triton backend
-- **Python 3.8+**: With required packages
-
-The extension assumes these dependencies are already installed in the container.
-
-## Settings
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `hipGenerator.amdApiKey` | "" | AMD LLM Gateway API Key |
-| `hipGenerator.defaultBackend` | "triton" | Default backend (triton/hip) |
-| `hipGenerator.maxAttempts` | 3 | Max generation attempts |
-| `hipGenerator.temperature` | 0.3 | LLM temperature |
-| `hipGenerator.targetSpeedup` | 1.0 | Target speedup vs baseline |
-| `hipGenerator.pythonPath` | "python3" | Python interpreter path |
+1. Select existing Triton kernel code in the editor
+2. **Right-click** → **"Optimize Triton Kernel"**
+3. The optimized code will be appended to your file
 
 ## Input Code Format
 
-Your PyTorch code should follow this structure:
+Your PyTorch code should include:
 
 ```python
 import torch
 import torch.nn as nn
 
 class Model(nn.Module):
-    def __init__(self, hidden_dim=1024):
+    def __init__(self):
         super().__init__()
-        self.linear = nn.Linear(hidden_dim, hidden_dim)
     
-    def forward(self, x):
-        return self.linear(x)
+    def forward(self, x, y):
+        return torch.matmul(x, y)
 
-# Optional - will be auto-inferred if not provided
 def get_inputs():
-    return [torch.randn(1024, 1024, dtype=torch.bfloat16, device='cuda')]
+    """Returns test input tensors"""
+    return [
+        torch.randn(1024, 1024, dtype=torch.float16, device='cuda'),
+        torch.randn(1024, 1024, dtype=torch.float16, device='cuda')
+    ]
 
 def get_init_inputs():
-    return [1024]  # hidden_dim
+    """Returns Model.__init__ arguments"""
+    return []
 ```
 
-## Generated Code Format
+## Understanding Results
 
-The extension generates code with a `ModelNew` class that replaces PyTorch operations with Triton/HIP kernels:
+| Status | Meaning |
+|--------|---------|
+| Compile ✓ | Code compiles without errors |
+| Accuracy ✓ | Output matches PyTorch reference |
+| Speedup 2.5x | 2.5 times faster than PyTorch |
 
-```python
-import torch
-import triton
-import triton.language as tl
+## Configuration Options
 
-@triton.jit
-def matmul_kernel(...):
-    # Optimized Triton kernel
-    ...
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `amdApiKey` | (required) | AMD LLM Gateway API Key |
+| `maxAttempts` | 3 | Max retry attempts on failure |
+| `targetSpeedup` | 1.0 | Target speedup threshold |
+| `temperature` | 0.3 | LLM temperature (0-1) |
+| `pythonPath` | python3 | Python interpreter path |
 
-class ModelNew(nn.Module):
-    def __init__(self, hidden_dim=1024):
-        super().__init__()
-        self.weight = nn.Parameter(torch.randn(hidden_dim, hidden_dim))
-    
-    def forward(self, x):
-        # Uses Triton kernel instead of torch.mm
-        return triton_matmul(x, self.weight)
-```
+## Sidebar Panel
 
-## Development
+The sidebar shows:
+- **Current Task** — Running generation with cancel option
+- **Generation History** — Past 20 generations with results
+- Click **"View Code"** to see generated code
 
-### Build
+## Requirements
 
-```bash
-npm install
-npm run compile
-```
-
-### Watch Mode
-
-```bash
-npm run watch
-```
-
-### Debug
-
-1. Open the extension folder in VSCode
-2. Press F5 to launch a new Extension Development Host
-3. Test the extension in the new window
-
-### Package
-
-```bash
-npm run package
-# Creates hip-triton-generator-0.1.0.vsix
-```
-
-## Architecture
-
-```
-vscode-extension/
-├── src/
-│   ├── extension.ts          # Extension entry point
-│   ├── panels/
-│   │   └── GeneratorPanel.ts # Main WebView panel
-│   └── services/
-│       ├── PythonBackend.ts  # Python process management
-│       └── CodeAnalyzer.ts   # Input inference logic
-├── resources/
-│   └── icon.svg              # Extension icon
-└── package.json              # Extension manifest
-```
+- **Python 3.8+** with PyTorch and Triton installed
+- **AMD GPU** (Instinct MI series recommended)
+- **ROCm** runtime for GPU execution
 
 ## Troubleshooting
 
 ### "AMD API Key not configured"
-Set `hipGenerator.amdApiKey` in VSCode settings or export `LLM_GATEWAY_KEY`.
+Set your API key in Settings → `hipGenerator.amdApiKey`
 
 ### "HipGenerator not found"
-Ensure the extension is in the same directory as the HipGenerator Python code, or that `/root/HipGenerator` exists.
+The extension includes the Python backend. Ensure Python dependencies are installed:
+```bash
+pip install torch triton
+```
 
-### "Generation failed"
-Check the "HIP Generator" output channel in VSCode for detailed error messages.
-
-### Slow generation
-Generation can take 30-60 seconds depending on code complexity. The extension shows a spinner during generation.
+### Generation fails repeatedly
+- Increase `maxAttempts` to 5-10
+- Try a simpler operation first
+- Check the Output panel ("HIP Generator") for detailed logs
 
 ## License
 
-MIT
-
-
-
-
-
-
-
-
-
-
-
+MIT License - AMD © 2025

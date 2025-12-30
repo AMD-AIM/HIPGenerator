@@ -570,78 +570,260 @@ with torch.no_grad():
     return perf_info
 
 
-def build_profiler_feedback(eval_result: dict, perf_info: dict) -> str:
-    """Build detailed feedback from profiler results for optimization."""
+def analyze_kernel_code(code_path: str) -> dict:
+    """Analyze Triton kernel code to identify optimization opportunities."""
+    with open(code_path, 'r') as f:
+        code = f.read()
+    
+    analysis = {
+        "has_autotune": "@triton.autotune" in code,
+        "has_xcd_swizzle": "NUM_XCDS" in code or "xcd_id" in code,
+        "has_group_m": "GROUP_M" in code or "group_id" in code,
+        "has_env_vars": "TRITON_HIP_USE_BLOCK_PINGPONG" in code,
+        "has_precompute": "register_buffer" in code or "self._grid" in code or "self.grid" in code,
+        "block_sizes": [],
+        "num_warps": None,
+        "num_stages": None,
+        "is_elementwise": False,
+        "is_gemm": False,
+        "has_internal_loop": False,
+        "issues": [],
+        "suggestions": []
+    }
+    
+    import re
+    
+    # Detect operation type
+    code_lower = code.lower()
+    analysis["is_gemm"] = any(op in code_lower for op in ['matmul', 'mm(', 'bmm(', 'linear', 'gemm', 'dot('])
+    analysis["is_elementwise"] = any(op in code_lower for op in [
+        'sigmoid', 'relu', 'gelu', 'tanh', 'swish', 'silu', 'softmax', 'exp(', 'log('
+    ]) and not analysis["is_gemm"]
+    
+    # Extract block sizes from autotune or constexpr
+    block_matches = re.findall(r"BLOCK_(?:SIZE|M|N|K)['\"]?\s*[:\=]\s*(\d+)", code)
+    analysis["block_sizes"] = [int(b) for b in block_matches]
+    
+    # Check for num_warps
+    warps_match = re.search(r"num_warps\s*=\s*(\d+)", code)
+    if warps_match:
+        analysis["num_warps"] = int(warps_match.group(1))
+    
+    # Check for internal loops in element-wise kernels (BAD!)
+    if analysis["is_elementwise"]:
+        if re.search(r'for\s+\w+\s+in\s+range\s*\(.*BLOCK', code):
+            analysis["has_internal_loop"] = True
+            analysis["issues"].append("CRITICAL: Internal loop detected in element-wise kernel - this destroys performance!")
+            analysis["suggestions"].append("Remove internal loops - process entire BLOCK_SIZE at once with tl.arange()")
+    
+    # Generate suggestions based on analysis
+    if not analysis["has_autotune"]:
+        analysis["issues"].append("Missing @triton.autotune decorator")
+        if analysis["is_gemm"]:
+            analysis["suggestions"].append("""Add @triton.autotune with GEMM configs:
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+    ],
+    key=['M', 'N', 'K'],
+)""")
+        else:
+            analysis["suggestions"].append("""Add @triton.autotune with element-wise configs:
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
+    ],
+    key=['n_elements'],
+)""")
+    
+    if analysis["is_gemm"]:
+        if not analysis["has_xcd_swizzle"]:
+            analysis["issues"].append("Missing XCD swizzle for GEMM (32 XCDs on MI350)")
+            analysis["suggestions"].append("Add XCD swizzle: pid % 32 for xcd_id, pid // 32 for local_pid")
+        
+        if not analysis["has_group_m"]:
+            analysis["issues"].append("Missing L2 cache grouping (GROUP_M)")
+            analysis["suggestions"].append("Add GROUP_M=8 parameter and tile grouping for better L2 hit rate")
+    
+    if not analysis["has_env_vars"]:
+        analysis["issues"].append("Missing MI350 environment variables")
+        analysis["suggestions"].append("Add: os.environ['TRITON_HIP_USE_BLOCK_PINGPONG'] = '1'")
+    
+    # Check block sizes
+    if analysis["block_sizes"]:
+        max_block = max(analysis["block_sizes"])
+        if analysis["is_elementwise"] and max_block < 1024:
+            analysis["issues"].append(f"Small BLOCK_SIZE ({max_block}) for element-wise op")
+            analysis["suggestions"].append("Use larger BLOCK_SIZE (2048-8192) for better memory throughput")
+    
+    return analysis
+
+
+def build_profiler_feedback(eval_result: dict, perf_info: dict, code_path: str = None) -> str:
+    """Build detailed feedback from profiler results for optimization.
+    
+    Combines runtime profiler metrics with static code analysis to provide
+    targeted optimization suggestions.
+    """
     feedback_parts = []
     
     # Performance summary
-    feedback_parts.append("=== CURRENT KERNEL PERFORMANCE ===")
-    feedback_parts.append(f"Ref Time: {eval_result.get('ref_time_ms', 0):.3f}ms")
-    feedback_parts.append(f"New Time: {eval_result.get('new_time_ms', 0):.3f}ms")
-    feedback_parts.append(f"Current Speedup: {eval_result.get('speedup', 0):.2f}x")
+    feedback_parts.append("=" * 60)
+    feedback_parts.append("KERNEL PERFORMANCE ANALYSIS")
+    feedback_parts.append("=" * 60)
+    
+    baseline_time = eval_result.get('baseline_time_ms') or eval_result.get('ref_time_ms', 0)
+    optimized_time = eval_result.get('optimized_time_ms') or eval_result.get('new_time_ms', 0)
+    speedup = eval_result.get('speedup', 0)
+    
+    feedback_parts.append(f"\nBaseline Time: {baseline_time:.3f} ms")
+    feedback_parts.append(f"Current Time:  {optimized_time:.3f} ms")
+    feedback_parts.append(f"Speedup:       {speedup:.2f}x {'✓' if speedup >= 1.0 else '⚠ NEEDS IMPROVEMENT'}")
     
     # Profiler metrics
     if perf_info.get("kernel_name"):
-        feedback_parts.append(f"\n=== PROFILER METRICS ===")
-        feedback_parts.append(f"Kernel: {perf_info['kernel_name'][:60]}")
+        feedback_parts.append(f"\n--- Runtime Profiler Metrics ---")
+        feedback_parts.append(f"Kernel: {perf_info['kernel_name'][:80]}")
         
     if perf_info.get("avg_duration_us", 0) > 0:
-        feedback_parts.append(f"Avg kernel time: {perf_info['avg_duration_us']:.1f}us")
+        feedback_parts.append(f"Avg kernel time: {perf_info['avg_duration_us']:.1f} μs")
     
     if perf_info.get("lds_usage_bytes", 0) > 0:
         lds_kb = perf_info['lds_usage_bytes'] / 1024
-        feedback_parts.append(f"LDS Usage: {lds_kb:.1f}KB")
-        if lds_kb > 48:
-            feedback_parts.append("  ⚠️ HIGH LDS - may limit occupancy")
+        lds_status = "⚠ HIGH (may limit occupancy)" if lds_kb > 48 else "OK"
+        feedback_parts.append(f"LDS Usage: {lds_kb:.1f} KB [{lds_status}]")
     
     if perf_info.get("workgroup_size"):
         wg = perf_info['workgroup_size']
-        feedback_parts.append(f"Workgroup: {wg[0]}x{wg[1]}x{wg[2]}")
         total_threads = wg[0] * wg[1] * wg[2] if len(wg) == 3 else 0
-        if total_threads > 0 and total_threads < 256:
-            feedback_parts.append("  ⚠️ SMALL WORKGROUP - consider larger blocks")
+        wg_status = "⚠ SMALL" if total_threads < 256 else "OK"
+        feedback_parts.append(f"Workgroup: {wg[0]}x{wg[1]}x{wg[2]} = {total_threads} threads [{wg_status}]")
     
     if perf_info.get("grid_size"):
         grid = perf_info['grid_size']
-        feedback_parts.append(f"Grid: {grid[0]}x{grid[1]}x{grid[2]}")
+        total_blocks = grid[0] * grid[1] * grid[2] if len(grid) == 3 else grid[0]
+        feedback_parts.append(f"Grid: {grid[0]}x{grid[1]}x{grid[2]} = {total_blocks} blocks")
+        # Check if enough blocks for all XCDs
+        if total_blocks < 256:
+            feedback_parts.append(f"  ⚠ Only {total_blocks} blocks - may not fully utilize 32 XCDs (256 CUs)")
     
-    # Optimization hints from profiler
-    hints = perf_info.get("optimization_hints", [])
-    if hints:
-        feedback_parts.append(f"\n=== PROFILER HINTS ===")
-        for hint in hints:
-            feedback_parts.append(f"- {hint}")
+    # Static code analysis
+    code_analysis = None
+    if code_path:
+        try:
+            code_analysis = analyze_kernel_code(code_path)
+            
+            feedback_parts.append(f"\n--- Code Analysis ---")
+            feedback_parts.append(f"Operation type: {'GEMM/Matmul' if code_analysis['is_gemm'] else 'Element-wise' if code_analysis['is_elementwise'] else 'Unknown'}")
+            feedback_parts.append(f"Has @triton.autotune: {'✓' if code_analysis['has_autotune'] else '✗ MISSING'}")
+            
+            if code_analysis['is_gemm']:
+                feedback_parts.append(f"Has XCD swizzle: {'✓' if code_analysis['has_xcd_swizzle'] else '✗ MISSING'}")
+                feedback_parts.append(f"Has L2 grouping (GROUP_M): {'✓' if code_analysis['has_group_m'] else '✗ MISSING'}")
+            
+            feedback_parts.append(f"Has env vars: {'✓' if code_analysis['has_env_vars'] else '✗ MISSING'}")
+            
+            if code_analysis['block_sizes']:
+                feedback_parts.append(f"Block sizes found: {code_analysis['block_sizes']}")
+            
+            if code_analysis['has_internal_loop']:
+                feedback_parts.append(f"⚠ CRITICAL: Has internal loop in element-wise kernel!")
+                
+        except Exception as e:
+            feedback_parts.append(f"Code analysis error: {str(e)[:100]}")
     
-    # MI350-specific recommendations based on metrics
-    feedback_parts.append(f"\n=== MI350 OPTIMIZATION CHECKLIST ===")
-    speedup = eval_result.get('speedup', 0)
+    # Generate targeted optimization suggestions
+    feedback_parts.append(f"\n{'=' * 60}")
+    feedback_parts.append("OPTIMIZATION RECOMMENDATIONS")
+    feedback_parts.append("=" * 60)
     
-    if speedup < 1.0:
-        feedback_parts.append("Target: Achieve >= 1.0x speedup")
-        feedback_parts.append("")
-        feedback_parts.append("1. XCD Swizzle (32 XCDs on MI350):")
-        feedback_parts.append("   - Add NUM_XCDS = 32 parameter")
-        feedback_parts.append("   - Remap pid: xcd_id = pid % NUM_XCDS; local_pid = pid // NUM_XCDS")
-        feedback_parts.append("")
-        feedback_parts.append("2. L2 Cache Grouping:")
-        feedback_parts.append("   - Add GROUP_M parameter (typically 8)")
-        feedback_parts.append("   - Group tiles to improve L2 hit rate")
-        feedback_parts.append("")
-        feedback_parts.append("3. MFMA Configuration:")
-        feedback_parts.append("   - Use matrix_instr_nonkdim=16 for 16x16 MFMA")
-        feedback_parts.append("   - Optimal block sizes: 128x128x64 or 256x128x64")
-        feedback_parts.append("")
-        feedback_parts.append("4. Environment Variables:")
-        feedback_parts.append("   - os.environ['TRITON_HIP_USE_BLOCK_PINGPONG'] = '1'")
-        feedback_parts.append("   - os.environ['TRITON_HIP_USE_ASYNC_COPY'] = '1'")
-        feedback_parts.append("")
-        feedback_parts.append("5. Launch Overhead:")
-        feedback_parts.append("   - Precompute grid, strides, output buffer in __init__")
-        feedback_parts.append("   - Avoid recomputing in forward()")
+    recommendations = []
+    priority = 1
+    
+    # Priority 1: Add autotune if missing
+    if code_analysis and not code_analysis['has_autotune']:
+        recommendations.append(f"""
+{priority}. [HIGH PRIORITY] Add @triton.autotune decorator
+   WHY: Autotune automatically finds optimal block sizes and num_warps
+   HOW: {code_analysis['suggestions'][0] if code_analysis['suggestions'] else 'Add @triton.autotune with multiple configs'}
+""")
+        priority += 1
+    
+    # Priority 2: Fix internal loops for element-wise
+    if code_analysis and code_analysis['has_internal_loop']:
+        recommendations.append(f"""
+{priority}. [CRITICAL] Remove internal loops in element-wise kernel
+   WHY: Internal loops destroy parallelism and memory throughput
+   HOW: Process entire BLOCK_SIZE at once:
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        x = tl.load(x_ptr + offsets, mask=mask)
+        y = compute(x)
+        tl.store(output_ptr + offsets, y, mask=mask)
+""")
+        priority += 1
+    
+    # Priority 3: XCD swizzle for GEMM
+    if code_analysis and code_analysis['is_gemm'] and not code_analysis['has_xcd_swizzle']:
+        recommendations.append(f"""
+{priority}. [HIGH PRIORITY] Add XCD swizzle for MI350 (32 XCDs)
+   WHY: Without XCD swizzle, only ~3% of GPU utilized (1/32 XCDs)
+   HOW: 
+        NUM_XCDS = 32
+        pids_per_xcd = tl.cdiv(num_pids, NUM_XCDS)
+        xcd_id = pid % NUM_XCDS
+        local_pid = pid // NUM_XCDS
+        pid = xcd_id * pids_per_xcd + local_pid
+""")
+        priority += 1
+    
+    # Priority 4: L2 cache grouping for GEMM
+    if code_analysis and code_analysis['is_gemm'] and not code_analysis['has_group_m']:
+        recommendations.append(f"""
+{priority}. [MEDIUM PRIORITY] Add L2 cache grouping (GROUP_M)
+   WHY: Groups adjacent tiles to improve L2 cache hit rate
+   HOW:
+        GROUP_M = 8
+        num_pid_in_group = GROUP_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_M
+        group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_M)
+        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+""")
+        priority += 1
+    
+    # Priority 5: Environment variables
+    if code_analysis and not code_analysis['has_env_vars']:
+        recommendations.append(f"""
+{priority}. [MEDIUM PRIORITY] Add MI350 environment variables
+   WHY: Enables advanced memory prefetching and async operations
+   HOW: Add at top of file:
+        import os
+        os.environ['TRITON_HIP_USE_BLOCK_PINGPONG'] = '1'
+        os.environ['TRITON_HIP_USE_ASYNC_COPY'] = '1'
+""")
+        priority += 1
+    
+    # Priority 6: Block size optimization
+    if code_analysis and code_analysis['is_elementwise'] and code_analysis['block_sizes']:
+        max_block = max(code_analysis['block_sizes']) if code_analysis['block_sizes'] else 0
+        if max_block < 2048:
+            recommendations.append(f"""
+{priority}. [MEDIUM PRIORITY] Increase BLOCK_SIZE for element-wise ops
+   WHY: Larger blocks improve memory throughput for bandwidth-bound ops
+   HOW: Use BLOCK_SIZE in range 2048-8192, let autotune pick best
+""")
+            priority += 1
+    
+    # Add recommendations to feedback
+    if recommendations:
+        for rec in recommendations:
+            feedback_parts.append(rec)
     else:
-        feedback_parts.append(f"✓ Good performance ({speedup:.2f}x speedup)")
-        if speedup < 1.5:
-            feedback_parts.append("Consider fine-tuning block sizes or prefetching")
+        feedback_parts.append("\n✓ Code looks well-optimized. Consider fine-tuning autotune configs.")
     
     return "\n".join(feedback_parts)
 
@@ -873,11 +1055,236 @@ def evaluate(problem_path: str, code_path: str, run_profiler: bool = False, back
                         for hint in perf_info["optimization_hints"]:
                             print(f"  - {hint}")
                     
-                    # Build profiler feedback for optimization
-                    result["profiler_feedback"] = build_profiler_feedback(result, perf_info)
+                    # Build profiler feedback for optimization (pass code_path for static analysis)
+                    result["profiler_feedback"] = build_profiler_feedback(result, perf_info, code_path)
                 except Exception as e:
                     result["perf_analysis"] = f"Profiler error: {str(e)[:100]}"
         
+    except Exception as e:
+        result["error"] = f"Unexpected error: {str(e)}\n{traceback.format_exc()}"
+    
+    return result
+
+
+def evaluate_triton_optimize(baseline_code_path: str, optimized_code_path: str, 
+                              baseline_class: str, optimized_class: str,
+                              run_profiler: bool = False) -> dict:
+    """Evaluate optimized Triton kernel against user's baseline Triton kernel.
+    
+    For triton2triton optimization:
+    - User's Triton kernel is the BASELINE (both for accuracy and performance)
+    - Optimized kernel must match baseline's output AND be faster
+    
+    Args:
+        baseline_code_path: Path to user's original Triton code (contains baseline class)
+        optimized_code_path: Path to optimized Triton code (contains optimized class)
+        baseline_class: Class name of user's kernel (e.g., 'ModelNew')
+        optimized_class: Class name of optimized kernel (e.g., 'ModelNewOptimized')
+        run_profiler: Whether to run rocprof analysis
+    """
+    result = {
+        "problem": "triton_optimize",
+        "baseline_code_path": baseline_code_path,
+        "optimized_code_path": optimized_code_path,
+        "baseline_class": baseline_class,
+        "optimized_class": optimized_class,
+        "compile_success": False,
+        "accuracy_pass": False,
+        "max_diff": float('inf'),
+        "mean_diff": float('inf'),
+        "has_nan": True,
+        "has_inf": True,
+        "baseline_time_ms": 0.0,
+        "optimized_time_ms": 0.0,
+        "speedup": 0.0,
+        "perf_analysis": "",
+        "profiler_feedback": "",
+        "error": None
+    }
+    
+    try:
+        # Check for cheating in optimized code
+        print(f"Checking optimized code for cheating patterns...")
+        cheat_check = detect_cheating(optimized_code_path, backend="triton")
+        if cheat_check["is_cheating"]:
+            result["error"] = cheat_check["cheating_reason"]
+            print(f"❌ {cheat_check['cheating_reason']}")
+            return result
+        
+        # Load baseline (user's Triton kernel)
+        print(f"Loading baseline: {baseline_code_path} (class: {baseline_class})")
+        baseline_module = load_generated_code(baseline_code_path, backend="triton")
+        BaselineModel = baseline_module.get(baseline_class)
+        
+        if not BaselineModel:
+            result["error"] = f"Baseline file missing class '{baseline_class}'"
+            return result
+        
+        # Get get_inputs from baseline file
+        get_inputs = baseline_module.get('get_inputs')
+        get_init_inputs = baseline_module.get('get_init_inputs')
+        
+        if not get_inputs:
+            result["error"] = "Baseline file missing get_inputs() function"
+            return result
+        
+        # Load optimized code
+        print(f"Loading optimized: {optimized_code_path} (class: {optimized_class})")
+        try:
+            optimized_module = load_generated_code(optimized_code_path, backend="triton")
+            result["compile_success"] = True
+        except Exception as e:
+            full_error = traceback.format_exc()
+            if len(full_error) > 3000:
+                error_excerpt = "..." + full_error[-3000:]
+            else:
+                error_excerpt = full_error
+            result["error"] = f"Compile error: {error_excerpt}"
+            return result
+        
+        OptimizedModel = optimized_module.get(optimized_class)
+        if not OptimizedModel:
+            result["error"] = f"Optimized code missing class '{optimized_class}'"
+            return result
+        
+        # Create models
+        print("Creating models...")
+        torch.manual_seed(42)
+        
+        init_inputs = get_init_inputs() if get_init_inputs else []
+        
+        if init_inputs:
+            baseline_model = BaselineModel(*init_inputs).cuda()
+            optimized_model = OptimizedModel(*init_inputs).cuda()
+        else:
+            baseline_model = BaselineModel().cuda()
+            optimized_model = OptimizedModel().cuda()
+        
+        # Get input dtype
+        torch.manual_seed(12345)
+        sample_inputs = get_inputs()
+        input_dtype = None
+        for inp in sample_inputs:
+            if isinstance(inp, torch.Tensor) and inp.is_floating_point():
+                input_dtype = inp.dtype
+                break
+        
+        if input_dtype is not None:
+            baseline_model = baseline_model.to(input_dtype)
+            optimized_model = optimized_model.to(input_dtype)
+        
+        # Copy weights (same logic as before)
+        baseline_state = baseline_model.state_dict()
+        optimized_state = optimized_model.state_dict()
+        
+        for key in baseline_state:
+            if key in optimized_state and baseline_state[key].shape == optimized_state[key].shape:
+                optimized_state[key] = baseline_state[key].clone()
+        
+        optimized_model.load_state_dict(optimized_state, strict=False)
+        
+        # Get inputs
+        torch.manual_seed(12345)
+        inputs = get_inputs()
+        inputs = [x.cuda() if isinstance(x, torch.Tensor) else x for x in inputs]
+        
+        # Run models
+        print("Running correctness test (optimized vs baseline)...")
+        with torch.no_grad():
+            baseline_output = baseline_model(*inputs)
+            try:
+                optimized_output = optimized_model(*inputs)
+            except Exception as e:
+                result["error"] = f"Runtime error: {str(e)}"
+                return result
+        
+        # Check correctness
+        if isinstance(baseline_output, tuple):
+            baseline_output = baseline_output[0]
+        if isinstance(optimized_output, tuple):
+            optimized_output = optimized_output[0]
+        
+        baseline_output = baseline_output.float()
+        optimized_output = optimized_output.float()
+        
+        diff = (baseline_output - optimized_output).abs()
+        result["max_diff"] = diff.max().item()
+        result["mean_diff"] = diff.mean().item()
+        result["has_nan"] = torch.isnan(optimized_output).any().item()
+        result["has_inf"] = torch.isinf(optimized_output).any().item()
+        
+        baseline_abs_max = baseline_output.abs().max().item()
+        relative_tolerance = max(1.0, baseline_abs_max * 0.05)
+        
+        result["accuracy_pass"] = (
+            not result["has_nan"] and 
+            not result["has_inf"] and 
+            result["max_diff"] < relative_tolerance
+        )
+        
+        print(f"Max diff: {result['max_diff']:.6f}")
+        print(f"Accuracy: {'PASS' if result['accuracy_pass'] else 'FAIL'}")
+        
+        # Benchmark: compare optimized vs baseline (not vs PyTorch!)
+        if result["accuracy_pass"]:
+            print("Running benchmark (optimized vs baseline)...")
+            with torch.no_grad():
+                result["baseline_time_ms"] = benchmark(lambda: baseline_model(*inputs))
+                result["optimized_time_ms"] = benchmark(lambda: optimized_model(*inputs))
+            
+            result["speedup"] = result["baseline_time_ms"] / result["optimized_time_ms"] if result["optimized_time_ms"] > 0 else 0
+            
+            # Also store as ref/new for compatibility
+            result["ref_time_ms"] = result["baseline_time_ms"]
+            result["new_time_ms"] = result["optimized_time_ms"]
+            
+            print(f"Baseline ({baseline_class}): {result['baseline_time_ms']:.3f} ms")
+            print(f"Optimized ({optimized_class}): {result['optimized_time_ms']:.3f} ms")
+            print(f"Speedup: {result['speedup']:.2f}x")
+            
+            if run_profiler:
+                print("Running rocprof analysis on optimized kernel...")
+                # For profiler, we need a problem file with get_inputs
+                # Create a temp file that has get_inputs from baseline
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+                    with open(baseline_code_path, 'r') as bf:
+                        baseline_code = bf.read()
+                    # Extract get_inputs and get_init_inputs
+                    import re
+                    get_inputs_match = re.search(r'def\s+get_inputs\s*\(\s*\)[\s\S]*?(?=\ndef\s|\nclass\s|\Z)', baseline_code)
+                    get_init_inputs_match = re.search(r'def\s+get_init_inputs\s*\(\s*\)[\s\S]*?(?=\ndef\s|\nclass\s|\Z)', baseline_code)
+                    
+                    # Build minimal problem file
+                    problem_code = "import torch\nimport torch.nn as nn\n\n"
+                    # Extract variable definitions (like batch_size, dim) before get_inputs
+                    var_defs_match = re.search(r'((?:^[a-z_][a-z_0-9]*\s*=\s*\d+\n?)+)', baseline_code, re.MULTILINE)
+                    if var_defs_match:
+                        problem_code += var_defs_match.group(1) + "\n"
+                    if get_inputs_match:
+                        problem_code += get_inputs_match.group(0) + "\n"
+                    if get_init_inputs_match:
+                        problem_code += get_init_inputs_match.group(0) + "\n"
+                    
+                    f.write(problem_code)
+                    temp_problem = f.name
+                
+                try:
+                    perf_info = run_rocprof_analysis(optimized_code_path, temp_problem, backend="triton")
+                    result["perf_analysis"] = perf_info.get("analysis", "")
+                    result["rocprof_metrics"] = {
+                        "kernel_name": perf_info.get("kernel_name"),
+                        "avg_duration_us": perf_info.get("avg_duration_us", 0),
+                        "lds_usage_bytes": perf_info.get("lds_usage_bytes", 0),
+                        "workgroup_size": perf_info.get("workgroup_size", []),
+                        "optimization_hints": perf_info.get("optimization_hints", []),
+                    }
+                    # Pass optimized_code_path for static code analysis
+                    result["profiler_feedback"] = build_profiler_feedback(result, perf_info, optimized_code_path)
+                except Exception as e:
+                    result["perf_analysis"] = f"Profiler error: {str(e)[:100]}"
+                finally:
+                    os.unlink(temp_problem)
+    
     except Exception as e:
         result["error"] = f"Unexpected error: {str(e)}\n{traceback.format_exc()}"
     
@@ -894,10 +1301,28 @@ def main():
                         help="Backend type: 'hip' for HipKittens, 'triton' for Triton (default: hip)")
     parser.add_argument("--ref-class", default="Model", help="Reference model class name (default: Model)")
     parser.add_argument("--new-class", default="ModelNew", help="Generated model class name (default: ModelNew)")
+    # New: triton2triton optimization mode
+    parser.add_argument("--triton-optimize", action="store_true",
+                        help="Triton2Triton mode: compare optimized kernel against user's baseline Triton kernel")
+    parser.add_argument("--baseline-code", help="Path to baseline Triton code (for --triton-optimize)")
+    parser.add_argument("--baseline-class", default="ModelNew", help="Baseline class name (for --triton-optimize)")
+    parser.add_argument("--optimized-class", default="ModelNewOptimized", help="Optimized class name (for --triton-optimize)")
     args = parser.parse_args()
     
-    result = evaluate(args.problem, args.code, run_profiler=args.profile, backend=args.backend,
-                     ref_class_name=args.ref_class, new_class_name=args.new_class)
+    # Triton2Triton optimization mode
+    if args.triton_optimize:
+        baseline_code = args.baseline_code or args.problem  # Use problem as baseline if not specified
+        result = evaluate_triton_optimize(
+            baseline_code_path=baseline_code,
+            optimized_code_path=args.code,
+            baseline_class=args.baseline_class,
+            optimized_class=args.optimized_class,
+            run_profiler=args.profile
+        )
+    else:
+        # Standard evaluation mode
+        result = evaluate(args.problem, args.code, run_profiler=args.profile, backend=args.backend,
+                         ref_class_name=args.ref_class, new_class_name=args.new_class)
     
     # Print summary
     print("\n" + "=" * 60)

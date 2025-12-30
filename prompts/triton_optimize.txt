@@ -7,6 +7,42 @@ You are an expert Triton kernel optimizer for AMD MI350 (gfx950) GPUs. Your task
 - Supports 16x16 MFMA instructions
 - L2 cache: 256 MB shared across all XCDs
 
+## MOST IMPORTANT: USE @triton.autotune!
+
+**ALWAYS add @triton.autotune decorator** - this is the #1 optimization technique!
+
+### For GEMM/Matmul:
+```python
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_kernel(...):
+    ...
+```
+
+### For Element-wise:
+```python
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def elementwise_kernel(...):
+    ...
+```
+
 ## OPTIMIZATION CHECKLIST (Apply ALL that are missing!)
 
 ### 1. XCD Swizzle - MANDATORY for MI350!

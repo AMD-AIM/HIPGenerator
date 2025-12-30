@@ -48,3 +48,10 @@ GEMM_FUSION_SUMMARY.md
 test_*.py
 output_*.py
 *.json.bak
+
+# VSCode Extension build artifacts
+vscode-extension/out/
+vscode-extension/node_modules/
+vscode-extension/*.vsix
+vscode-extension/hipgenerator/
+vscode-extension/.vscode-test/

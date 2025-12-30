@@ -774,30 +774,207 @@ Generate the optimized kernel code:"""
     return optimization_prompt
 
 
-def build_optimize_prompt(code: str, feedback: str = None, new_class_name: str = None) -> str:
-    """Build user prompt for optimization with optional feedback."""
-    prompt = f'''**Triton Kernel to Optimize:**
+def build_optimize_prompt(code: str, feedback: str = None, new_class_name: str = None, baseline_class_name: str = None) -> str:
+    """Build user prompt for triton2triton optimization.
+    
+    Args:
+        code: User's existing Triton kernel code (this is the BASELINE)
+        feedback: Profiler feedback from previous evaluation
+        new_class_name: Name for the optimized class (must be different from baseline)
+        baseline_class_name: Name of user's baseline class
+    """
+    # Detect baseline class name from code if not provided
+    if not baseline_class_name:
+        import re
+        class_match = re.search(r'class\s+(Model\w*)\s*\(', code)
+        baseline_class_name = class_match.group(1) if class_match else 'ModelNew'
+    
+    # Detect operation type
+    code_lower = code.lower()
+    is_gemm = any(op in code_lower for op in ['matmul', 'mm(', 'bmm(', 'linear', 'gemm'])
+    is_elementwise = any(op in code_lower for op in [
+        'sigmoid', 'relu', 'gelu', 'tanh', 'swish', 'silu', 'softmax', 'exp(', 'log('
+    ])
+    
+    opt_class_name = new_class_name or baseline_class_name + "Optimized"
+    
+    prompt = f'''**TRITON2TRITON OPTIMIZATION TASK**
+
+You are given a Triton kernel that works correctly but has suboptimal performance.
+Your task is to create an OPTIMIZED version that:
+1. Produces EXACTLY the same output as the baseline (numerical accuracy required)
+2. Runs FASTER than the baseline on AMD MI350 (gfx950) GPU
+
+**Baseline Kernel (class `{baseline_class_name}`):**
 ```python
 {code}
 ```
 
-Please optimize this Triton kernel for AMD MI350 (gfx950) GPU.
-Apply all missing MI350 optimizations and return the complete optimized code.
+**CRITICAL REQUIREMENTS:**
+1. Optimized class MUST be named `{opt_class_name}` (NOT `{baseline_class_name}`)
+2. Output must match baseline exactly (numerical accuracy)
+3. Copy get_inputs() and get_init_inputs() from baseline unchanged
+4. Include all imports (torch, triton, triton.language)
 '''
+
+    # Add autotune guidance
+    if is_gemm:
+        prompt += '''
+**GEMM OPTIMIZATION - USE @triton.autotune:**
+```python
+import triton
+from triton import cdiv
+
+@triton.autotune(
+    configs=[
+        triton.Config({{'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}}, num_stages=3, num_warps=8),
+        triton.Config({{'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}}, num_stages=3, num_warps=8),
+        triton.Config({{'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_M': 8}}, num_stages=3, num_warps=8),
+        triton.Config({{'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}}, num_stages=4, num_warps=4),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # XCD Swizzle for MI350 (32 XCDs)
+    NUM_XCDS = 32
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pids = num_pid_m * num_pid_n
     
-    # Specify new class name if provided
-    if new_class_name:
-        prompt += f'''
-**IMPORTANT: Name the optimized model class `{new_class_name}`** (not ModelNew).
+    pids_per_xcd = tl.cdiv(num_pids, NUM_XCDS)
+    xcd_id = pid % NUM_XCDS
+    local_pid = pid // NUM_XCDS
+    remapped_pid = tl.where(local_pid < pids_per_xcd,
+                            xcd_id * pids_per_xcd + local_pid, pid)
+    pid = tl.where(remapped_pid < num_pids, remapped_pid, pid)
+    
+    # L2 Cache Grouping
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    # ... rest of kernel
+```
 '''
+    elif is_elementwise:
+        prompt += '''
+**ELEMENT-WISE OPTIMIZATION - USE @triton.autotune:**
+```python
+@triton.autotune(
+    configs=[
+        triton.Config({{'BLOCK_SIZE': 1024}}, num_warps=4),
+        triton.Config({{'BLOCK_SIZE': 2048}}, num_warps=8),
+        triton.Config({{'BLOCK_SIZE': 4096}}, num_warps=8),
+        triton.Config({{'BLOCK_SIZE': 8192}}, num_warps=16),
+    ],
+    key=['n_elements'],
+)
+@triton.jit
+def elementwise_kernel(
+    x_ptr, output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
     
+    # Load entire block at once (NO internal loops!)
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    
+    # Apply operation
+    y = compute(x)  # e.g., x * tl.sigmoid(x) for swish
+    
+    # Store result
+    tl.store(output_ptr + offsets, y, mask=mask)
+
+
+# CORRECT grid usage with autotune (IMPORTANT!):
+class ModelOptimized(nn.Module):
+    def forward(self, x):
+        x_flat = x.contiguous().view(-1)
+        output = torch.empty_like(x_flat)
+        n_elements = x_flat.numel()
+        
+        # Grid MUST be assigned to a variable first!
+        grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+        elementwise_kernel[grid](x_flat, output, n_elements)
+        
+        return output.view(x.shape)
+```
+
+**CRITICAL for element-wise ops:**
+- NO internal for loops - process entire BLOCK_SIZE at once
+- Use larger BLOCK_SIZE (2048-8192) for better memory throughput
+- Grid lambda MUST be assigned first: `grid = lambda meta: ...; kernel[grid](...)`
+- Do NOT inline lambda in brackets: kernel[(lambda meta: ...)]  <- WRONG!
+'''
+
     if feedback:
         prompt += f'''
-
-**IMPORTANT - Feedback from Profiler/Evaluation:**
+**PROFILER FEEDBACK (from baseline analysis):**
 {feedback}
 
-Please address the issues mentioned above and generate improved code.
+Use this feedback to identify bottlenecks and apply targeted optimizations.
+'''
+
+    prompt += '''
+**MI350 OPTIMIZATION CHECKLIST:**
+1. ✅ @triton.autotune - Let Triton find optimal config
+2. ✅ XCD Swizzle (NUM_XCDS=32) - For GEMM/matmul only
+3. ✅ L2 Cache Grouping (GROUP_M=8) - For GEMM/matmul only
+4. ✅ matrix_instr_nonkdim=16 in kernel launch - For MFMA
+5. ✅ TRITON_HIP_USE_BLOCK_PINGPONG=1 env var
+6. ✅ Precompute grid/strides in __init__
+7. ✅ NO internal loops for element-wise ops
+
+**OUTPUT:**
+Return COMPLETE Python code with:
+- All imports
+- @triton.autotune decorated kernel
+- class {opt_class_name}(nn.Module)
+- get_inputs() and get_init_inputs() copied from baseline
+
+```python
+import os
+os.environ['TRITON_HIP_USE_BLOCK_PINGPONG'] = '1'
+
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+
+@triton.autotune(...)
+@triton.jit
+def optimized_kernel(...):
+    ...
+
+class ''' + opt_class_name + '''(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, x):
+        ...
+
+def get_inputs():
+    # Copy from baseline
+    ...
+
+def get_init_inputs():
+    # Copy from baseline
+    ...
+```
 '''
     
     return prompt
@@ -937,16 +1114,28 @@ def main():
             print("Error: LLM_GATEWAY_KEY environment variable not set")
             sys.exit(1)
         
-        # Load code to optimize
+        # Load code to optimize (this is the user's baseline Triton kernel)
         with open(args.optimize) as f:
             code_to_optimize = f.read()
+        
+        # Detect baseline class name from code
+        import re
+        baseline_match = re.search(r'class\s+(Model\w*)\s*\(', code_to_optimize)
+        baseline_class = baseline_match.group(1) if baseline_match else 'ModelNew'
+        
+        # Ensure new class name is different from baseline
+        if args.new_class_name == baseline_class:
+            print(f"Warning: new_class_name ({args.new_class_name}) same as baseline ({baseline_class})")
+            args.new_class_name = baseline_class + 'Optimized'
+            print(f"  Changed to: {args.new_class_name}")
         
         # Load optimization prompt
         system_prompt = load_optimize_prompt()
         user_prompt = build_optimize_prompt(
             code_to_optimize, 
             feedback=args.feedback,
-            new_class_name=args.new_class_name
+            new_class_name=args.new_class_name,
+            baseline_class_name=baseline_class
         )
         
         # Ensure output directory exists

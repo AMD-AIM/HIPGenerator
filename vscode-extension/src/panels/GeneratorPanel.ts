@@ -659,6 +659,7 @@ def get_init_inputs():
         let currentBackend = 'triton';
         let analysisResult = null;
         let generatedCode = '';
+        const TARGET_SPEEDUP = ${vscode.workspace.getConfiguration('hipGenerator').get<number>('targetSpeedup') || 1.0};
         
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
@@ -882,7 +883,7 @@ def get_init_inputs():
             
             const compileClass = result.compile_success ? 'success' : 'error';
             const accuracyClass = result.accuracy_pass ? 'success' : 'error';
-            const speedupClass = result.speedup >= 1.0 ? 'success' : (result.speedup > 0 ? '' : 'error');
+            const speedupClass = result.speedup >= TARGET_SPEEDUP ? 'success' : (result.speedup > 0 ? '' : 'error');
             
             resultsContent.innerHTML = \`
                 <div class="results-grid">

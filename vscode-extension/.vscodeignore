@@ -1,22 +1,19 @@
 .vscode/**
 .vscode-test/**
 src/**
+*.ts
+*.map
 .gitignore
-.yarnrc
-vsc-extension-quickstart.md
-**/tsconfig.json
-**/.eslintrc.json
-**/*.map
-**/*.ts
+.eslintrc*
+tsconfig.json
 node_modules/**
+*.vsix
+.git/**
+*.md
 
-
-
-
-
-
-
-
-
-
-
+# Keep these
+!out/**
+!hipgenerator/**
+!resources/**
+!package.json
+!README.md

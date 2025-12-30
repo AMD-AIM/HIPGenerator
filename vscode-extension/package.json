@@ -1,8 +1,8 @@
 {
-  "name": "hip-triton-generator",
-  "displayName": "HIP/Triton Generator",
-  "description": "Generate optimized Triton/HIP kernels from PyTorch code using LLM",
-  "version": "0.1.0",
+  "name": "amd-hip-triton-generator",
+  "displayName": "AMD HIP/Triton Generator",
+  "description": "Generate optimized Triton/HIP kernels from PyTorch code for AMD GPUs using LLM",
+  "version": "1.0.0",
   "publisher": "amd",
   "engines": {
     "vscode": "^1.85.0"
@@ -128,12 +128,14 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "npm run compile && npm run obfuscate-backend",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile",
     "lint": "eslint src --ext ts",
-    "package": "vsce package"
+    "copy-backend": "bash ./copy-backend.sh",
+    "obfuscate-backend": "bash ./obfuscate.sh || npm run copy-backend",
+    "package": "npm run obfuscate-backend && vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",

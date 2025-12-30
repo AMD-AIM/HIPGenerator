@@ -49,6 +49,8 @@ export interface EvaluationResult {
     has_inf: boolean;
     ref_time_ms: number;
     new_time_ms: number;
+    baseline_time_ms?: number;  // For triton2triton
+    optimized_time_ms?: number;  // For triton2triton
     speedup: number;
     error?: string;
 }
@@ -76,7 +78,8 @@ export class PythonBackend {
      */
     async generateWithProgress(
         request: GenerationRequest,
-        progress: vscode.Progress<{ message?: string; increment?: number }>
+        progress: vscode.Progress<{ message?: string; increment?: number }>,
+        attemptCallback?: (attempt: number, maxAttempts: number) => void
     ): Promise<GenerationResult> {
         const config = vscode.workspace.getConfiguration('hipGenerator');
         const apiKey = config.get<string>('amdApiKey');
@@ -123,6 +126,11 @@ export class PythonBackend {
                     message: `Attempt ${attempt}/${maxAttempts}: Calling LLM...`,
                     increment: 0
                 });
+                
+                // Notify caller of current attempt
+                if (attemptCallback) {
+                    attemptCallback(attempt, maxAttempts);
+                }
 
                 this._outputChannel.appendLine(`\n--- Attempt ${attempt}/${maxAttempts} ---`);
 
@@ -238,10 +246,11 @@ export class PythonBackend {
                          evalResult.has_inf ? 'Output contains Inf' : 
                          `Max diff too high: ${evalResult.max_diff}`);
                     this._outputChannel.appendLine(`  → Next retry: reflection (accuracy error)`);
-                } else if (evalResult.speedup < 1.0) {
+                } else if (evalResult.speedup < (config.get<number>('targetSpeedup') || 1.0)) {
                     // Correct but slow - use optimization
                     retryMode = 'optimization';
-                    this._outputChannel.appendLine(`  → Next retry: optimization (speedup=${evalResult.speedup.toFixed(2)}x < 1.0x)`);
+                    const target = config.get<number>('targetSpeedup') || 1.0;
+                    this._outputChannel.appendLine(`  → Next retry: optimization (speedup=${evalResult.speedup.toFixed(2)}x < target ${target}x)`);
                 }
 
                 // Track best result
@@ -251,9 +260,10 @@ export class PythonBackend {
                         bestEval = evalResult;
                     }
                     
-                    // If we got a good result (speedup >= 1.0), we can stop
-                    if (evalResult.speedup >= 1.0) {
-                        this._outputChannel.appendLine(`✓ Target achieved! Speedup: ${evalResult.speedup.toFixed(2)}x`);
+                    // If we got a good result (speedup >= target), we can stop
+                    const targetSpeedup = config.get<number>('targetSpeedup') || 1.0;
+                    if (evalResult.speedup >= targetSpeedup) {
+                        this._outputChannel.appendLine(`✓ Target achieved! Speedup: ${evalResult.speedup.toFixed(2)}x (target: ${targetSpeedup}x)`);
                         break;
                     }
                 } else if (!bestCode) {
@@ -265,14 +275,21 @@ export class PythonBackend {
 
             // Return result
             if (bestCode) {
-                return {
+                const result = {
                     success: bestEval?.accuracy_pass || false,
                     code: bestCode,
                     evaluation: bestEval,
                     attempts: maxAttempts,
                     error: bestEval?.accuracy_pass ? undefined : lastError
                 };
+                this._outputChannel.appendLine(`\n=== FINAL RESULT ===`);
+                this._outputChannel.appendLine(`success=${result.success}`);
+                this._outputChannel.appendLine(`speedup=${result.evaluation?.speedup}`);
+                this._outputChannel.appendLine(`accuracy_pass=${result.evaluation?.accuracy_pass}`);
+                this._outputChannel.appendLine(`===================\n`);
+                return result;
             } else {
+                this._outputChannel.appendLine(`\n=== FINAL RESULT: NO CODE ===\n`);
                 return {
                     success: false,
                     error: lastError || 'All attempts failed'
@@ -305,12 +322,18 @@ export class PythonBackend {
     }
 
     /**
-     * Optimize existing Triton kernel code with evaluation loop
-     * Flow: eval (get profiler feedback) → generate → eval → repeat
+     * Optimize existing Triton kernel code (triton2triton)
+     * 
+     * Key principle: User's Triton kernel is the BASELINE
+     * - Accuracy: compare optimized output vs user's kernel output
+     * - Performance: compare optimized time vs user's kernel time
+     * 
+     * Flow: profile baseline → generate optimized → eval (vs baseline) → repeat
      */
     async optimize(
         request: OptimizeRequest,
-        progress: vscode.Progress<{ message?: string; increment?: number }>
+        progress: vscode.Progress<{ message?: string; increment?: number }>,
+        attemptCallback?: (attempt: number, maxAttempts: number) => void
     ): Promise<GenerationResult> {
         const config = vscode.workspace.getConfiguration('hipGenerator');
         const apiKey = config.get<string>('amdApiKey');
@@ -332,38 +355,33 @@ export class PythonBackend {
             };
         }
 
-        // Class name handling
-        const currentClassName = request.currentClassName || 'ModelNew';
-        const newClassName = request.newClassName || currentClassName + 'New';
-        const refClassName = request.refClassName || 'Model';
-
-        // Create input code file with existing Triton code
-        const inputCodeFile = path.join(this._tempDir, `optimize_input_${Date.now()}.py`);
-        fs.writeFileSync(inputCodeFile, request.code);
+        // Class name handling for triton2triton
+        // User's kernel class is the BASELINE
+        const baselineClassName = request.currentClassName || 'ModelNew';
+        // Generate a unique name for the optimized kernel (must NOT conflict with baseline)
+        const optimizedClassName = request.newClassName || baselineClassName + 'Optimized';
         
-        // Create problem file for evaluation (original PyTorch code + get_inputs)
-        let problemFile: string | undefined;
-        if (request.originalCode) {
-            problemFile = path.join(this._tempDir, `optimize_problem_${Date.now()}.py`);
-            let problemContent = request.originalCode;
-            if (request.getInputs && !problemContent.includes('def get_inputs()')) {
-                problemContent += '\n\n' + request.getInputs;
-            }
-            if (request.getInitInputs && !problemContent.includes('def get_init_inputs()')) {
-                problemContent += '\n\n' + request.getInitInputs;
-            }
-            fs.writeFileSync(problemFile, problemContent);
+        // Ensure names don't conflict
+        if (optimizedClassName === baselineClassName) {
+            return {
+                success: false,
+                error: `Optimized class name '${optimizedClassName}' cannot be the same as baseline '${baselineClassName}'`
+            };
         }
+
+        // Create baseline code file (user's Triton kernel is the baseline)
+        const baselineCodeFile = path.join(this._tempDir, `baseline_${Date.now()}.py`);
+        fs.writeFileSync(baselineCodeFile, request.code);
         
         const outputDir = path.join(this._tempDir, `optimize_output_${Date.now()}`);
         fs.mkdirSync(outputDir, { recursive: true });
 
         this._outputChannel.appendLine(`\n${'='.repeat(60)}`);
-        this._outputChannel.appendLine(`Optimizing Triton kernel (triton2triton)...`);
-        this._outputChannel.appendLine(`Current class: ${currentClassName} → New class: ${newClassName}`);
-        this._outputChannel.appendLine(`Reference class: ${refClassName}`);
+        this._outputChannel.appendLine(`Triton2Triton Optimization`);
+        this._outputChannel.appendLine(`Baseline class: ${baselineClassName} (user's kernel)`);
+        this._outputChannel.appendLine(`Optimized class: ${optimizedClassName} (to be generated)`);
         this._outputChannel.appendLine(`Max attempts: ${maxAttempts}`);
-        this._outputChannel.appendLine(`Has reference for evaluation: ${problemFile ? 'Yes' : 'No'}`);
+        this._outputChannel.appendLine(`Note: Baseline IS the user's Triton kernel (not PyTorch reference)`);
         this._outputChannel.show(true);
 
         let bestCode: string | undefined;
@@ -372,65 +390,60 @@ export class PythonBackend {
         let feedback: string = request.feedback || '';
 
         try {
-            // Step 1: Initial evaluation of current code (get profiler feedback)
-            if (problemFile) {
-                progress.report({ 
-                    message: `Step 1: Evaluating current kernel with profiler...`,
-                    increment: 0
-                });
+            // Step 1: Profile the baseline (user's kernel)
+            progress.report({ 
+                message: `Step 1: Profiling baseline kernel (${baselineClassName})...`,
+                increment: 0
+            });
 
-                this._outputChannel.appendLine(`\n--- Step 1: Initial Profiler Analysis ---`);
-                
-                // For initial eval, we need to use the full input code file (not just selected code)
-                // because it needs to contain both the kernel and the ModelNew class
-                const initialEval = await this._evaluateWithProfiler(
-                    fs.readFileSync(inputCodeFile, 'utf-8'),  // Use full input file
-                    problemFile,
-                    'triton',
-                    pythonPath,
-                    hipGeneratorPath,
-                    refClassName,
-                    currentClassName
+            this._outputChannel.appendLine(`\n--- Step 1: Profiling Baseline Kernel ---`);
+            
+            // Run baseline kernel to get performance metrics
+            const baselineEval = await this._evaluateTritonBaseline(
+                baselineCodeFile,
+                baselineClassName,
+                pythonPath,
+                hipGeneratorPath
+            );
+            
+            if (baselineEval.compile_success) {
+                this._outputChannel.appendLine(
+                    `Baseline performance: ${baselineEval.baseline_time_ms?.toFixed(3) || 'N/A'} ms`
                 );
-
-                if (initialEval.compile_success) {
-                    this._outputChannel.appendLine(
-                        `Current performance: Speedup=${initialEval.speedup?.toFixed(2) || 'N/A'}x`
-                    );
-                    
-                    // Use profiler feedback if available
-                    if (initialEval.profiler_feedback) {
-                        feedback = initialEval.profiler_feedback;
-                        this._outputChannel.appendLine(`Profiler feedback obtained`);
-                    } else {
-                        // Build basic feedback
-                        feedback = this._buildOptimizeFeedback(initialEval, 
-                            initialEval.accuracy_pass ? 'performance' : 'accuracy');
-                    }
-                    
-                    progress.report({ 
-                        message: `Current: Speedup=${initialEval.speedup?.toFixed(2) || 'N/A'}x`,
-                        increment: 10
-                    });
+                
+                if (baselineEval.profiler_feedback) {
+                    feedback = baselineEval.profiler_feedback;
+                    this._outputChannel.appendLine(`Profiler feedback obtained`);
                 } else {
-                    this._outputChannel.appendLine(`Current code has compile error: ${initialEval.error?.substring(0, 200) || 'unknown'}`);
-                    feedback = this._buildOptimizeFeedback(initialEval, 'compile');
+                    // Build feedback for optimization
+                    feedback = this._buildTritonOptimizeFeedback(baselineEval);
                 }
-            } else {
-                this._outputChannel.appendLine(`⚠️ No reference Model class found - skipping initial evaluation`);
-                this._outputChannel.appendLine(`For best results, include a reference 'class Model(nn.Module)' in your file`);
+                
                 progress.report({ 
-                    message: `No reference found, proceeding with optimization...`,
+                    message: `Baseline: ${baselineEval.baseline_time_ms?.toFixed(3) || 'N/A'} ms`,
                     increment: 10
                 });
+            } else {
+                this._outputChannel.appendLine(`⚠️ Baseline kernel has issues: ${baselineEval.error?.substring(0, 200) || 'unknown'}`);
+                this._outputChannel.appendLine(`Proceeding with optimization anyway...`);
+                feedback = `The current kernel has issues: ${baselineEval.error || 'compilation error'}. Please fix these issues while optimizing.`;
             }
 
-            // Step 2+: Generate → Eval loop
+            // Step 2+: Generate → Eval loop (ALWAYS run all attempts, keep best)
+            // Key change: Don't break early even if speedup >= 1.0
+            // Generate multiple attempts and pick the best one
+            const allResults: Array<{code: string; eval: EvaluationResult & { profiler_feedback?: string }}> = [];
+            
             for (let attempt = 1; attempt <= maxAttempts; attempt++) {
                 progress.report({ 
-                    message: `Attempt ${attempt}/${maxAttempts}: Calling LLM for optimization...`,
+                    message: `Attempt ${attempt}/${maxAttempts}: Generating optimized kernel...`,
                     increment: 0
                 });
+                
+                // Notify caller of current attempt
+                if (attemptCallback) {
+                    attemptCallback(attempt, maxAttempts);
+                }
 
                 this._outputChannel.appendLine(`\n--- Optimization Attempt ${attempt}/${maxAttempts} ---`);
                 if (feedback) {
@@ -442,19 +455,19 @@ export class PythonBackend {
                 const generateResult = await this._runOptimize(
                     pythonPath,
                     hipGeneratorPath,
-                    inputCodeFile,
+                    baselineCodeFile,
                     outputFile,
                     apiKey,
                     config.get<number>('temperature') || 0.3,
                     feedback,
-                    newClassName
+                    optimizedClassName  // New class name for optimized kernel
                 );
 
                 if (!generateResult.success || !fs.existsSync(outputFile)) {
                     lastError = generateResult.error || 'Optimization failed';
-                    this._outputChannel.appendLine(`Optimization failed: ${lastError}`);
+                    this._outputChannel.appendLine(`Generation failed: ${lastError}`);
                     progress.report({ 
-                        message: `Attempt ${attempt}/${maxAttempts}: LLM call failed, retrying...`,
+                        message: `Attempt ${attempt}/${maxAttempts}: LLM call failed, continuing...`,
                         increment: 100 / maxAttempts / 3
                     });
                     feedback = `Previous attempt failed with error: ${lastError}. Please fix and try again.`;
@@ -464,101 +477,117 @@ export class PythonBackend {
                 const optimizedCode = fs.readFileSync(outputFile, 'utf-8');
                 this._outputChannel.appendLine(`Generated optimized code: ${optimizedCode.length} chars`);
 
-                // Basic validation - check if we got valid Python/Triton code
+                // Basic validation
                 if (optimizedCode.length < 100 || 
                     (!optimizedCode.includes('@triton') && !optimizedCode.includes('triton.jit'))) {
                     lastError = 'Generated code does not appear to be valid Triton code';
                     this._outputChannel.appendLine(`Warning: ${lastError}`);
                     feedback = `Previous output was not valid Triton code. Please generate proper Triton kernel code with @triton.jit decorator.`;
                     progress.report({ 
-                        message: `Attempt ${attempt}/${maxAttempts}: Invalid code, retrying...`,
+                        message: `Attempt ${attempt}/${maxAttempts}: Invalid code, continuing...`,
                         increment: 100 / maxAttempts / 3
                     });
                     continue;
                 }
 
-                // Evaluate with profiler if we have a reference
-                if (problemFile) {
-                    progress.report({ 
-                        message: `Attempt ${attempt}/${maxAttempts}: Evaluating with profiler...`,
-                        increment: 100 / maxAttempts / 3
-                    });
+                // Verify the optimized code contains the correct class name
+                if (!optimizedCode.includes(`class ${optimizedClassName}`)) {
+                    this._outputChannel.appendLine(`Warning: Generated code missing class ${optimizedClassName}`);
+                    feedback = `Generated code must contain class ${optimizedClassName}. Do not reuse the baseline class name ${baselineClassName}.`;
+                    continue;
+                }
 
-                    const evalResult = await this._evaluateWithProfiler(
-                        optimizedCode,
-                        problemFile,
-                        'triton',
-                        pythonPath,
-                        hipGeneratorPath,
-                        refClassName,
-                        newClassName
-                    );
+                // Evaluate: compare optimized kernel vs baseline kernel
+                progress.report({ 
+                    message: `Attempt ${attempt}/${maxAttempts}: Evaluating vs baseline...`,
+                    increment: 100 / maxAttempts / 3
+                });
 
-                    const statusEmoji = evalResult.compile_success 
-                        ? (evalResult.accuracy_pass ? '✓' : '⚠') 
-                        : '✗';
-                    
-                    this._outputChannel.appendLine(
-                        `  Compile: ${evalResult.compile_success ? '✓' : '✗'} | ` +
-                        `Accuracy: ${evalResult.accuracy_pass ? '✓' : '✗'} | ` +
-                        `Speedup: ${evalResult.speedup?.toFixed(2) || 'N/A'}x`
-                    );
+                const evalResult = await this._evaluateTritonOptimize(
+                    baselineCodeFile,       // User's kernel as baseline
+                    outputFile,             // Generated optimized kernel
+                    baselineClassName,      // User's class name
+                    optimizedClassName,     // New optimized class name
+                    pythonPath,
+                    hipGeneratorPath
+                );
 
-                    progress.report({ 
-                        message: `Attempt ${attempt}/${maxAttempts}: ${statusEmoji} ` +
-                            `Compile=${evalResult.compile_success ? '✓' : '✗'} ` +
-                            `Accuracy=${evalResult.accuracy_pass ? '✓' : '✗'} ` +
-                            `Speedup=${evalResult.speedup?.toFixed(2) || 'N/A'}x`,
-                        increment: 100 / maxAttempts / 3
-                    });
+                const statusEmoji = evalResult.compile_success 
+                    ? (evalResult.accuracy_pass ? '✓' : '⚠') 
+                    : '✗';
+                
+                this._outputChannel.appendLine(
+                    `  Compile: ${evalResult.compile_success ? '✓' : '✗'} | ` +
+                    `Accuracy: ${evalResult.accuracy_pass ? '✓' : '✗'} | ` +
+                    `Speedup vs baseline: ${evalResult.speedup?.toFixed(2) || 'N/A'}x`
+                );
 
-                    // Track best result
-                    if (evalResult.compile_success && evalResult.accuracy_pass) {
-                        if (!bestEval || evalResult.speedup > bestEval.speedup) {
-                            bestCode = optimizedCode;
-                            bestEval = evalResult;
-                        }
-                        
-                        // If we got a good speedup, we can stop
-                        if (evalResult.speedup >= 1.0) {
-                            this._outputChannel.appendLine(`✓ Target achieved! Speedup: ${evalResult.speedup.toFixed(2)}x`);
-                            break;
-                        } else {
-                            // Use profiler feedback for next attempt
-                            feedback = evalResult.profiler_feedback || 
-                                this._buildOptimizeFeedback(evalResult, 'performance');
-                        }
+                progress.report({ 
+                    message: `Attempt ${attempt}/${maxAttempts}: ${statusEmoji} ` +
+                        `Compile=${evalResult.compile_success ? '✓' : '✗'} ` +
+                        `Accuracy=${evalResult.accuracy_pass ? '✓' : '✗'} ` +
+                        `Speedup=${evalResult.speedup?.toFixed(2) || 'N/A'}x`,
+                    increment: 100 / maxAttempts / 3
+                });
+
+                // Store all results
+                allResults.push({ code: optimizedCode, eval: evalResult });
+
+                // Get target speedup from config
+                const targetSpeedup = config.get<number>('targetSpeedup') || 1.0;
+
+                // Build feedback based on result for next attempt
+                if (evalResult.compile_success && evalResult.accuracy_pass) {
+                    // Success - but continue to find better
+                    if ((evalResult.speedup || 0) >= targetSpeedup) {
+                        this._outputChannel.appendLine(`  Good result! Speedup: ${evalResult.speedup?.toFixed(2)}x >= target ${targetSpeedup}x (continuing to find better)`);
+                        feedback = `Previous attempt achieved ${evalResult.speedup?.toFixed(2)}x speedup. Try to achieve even better performance with more aggressive optimizations.`;
                     } else {
-                        // Build feedback based on failure type
-                        if (!evalResult.compile_success) {
-                            feedback = this._buildOptimizeFeedback(evalResult, 'compile');
-                            lastError = evalResult.error || 'Compilation failed';
-                        } else {
-                            feedback = evalResult.profiler_feedback || 
-                                this._buildOptimizeFeedback(evalResult, 'accuracy');
-                            lastError = evalResult.error || 
-                                (evalResult.has_nan ? 'Output contains NaN' : 
-                                 evalResult.has_inf ? 'Output contains Inf' : 
-                                 `Max diff too high: ${evalResult.max_diff}`);
-                        }
-                        
-                        // Keep the code even if it failed (user might want to debug)
-                        if (!bestCode) {
-                            bestCode = optimizedCode;
-                            bestEval = evalResult;
-                        }
+                        feedback = evalResult.profiler_feedback || 
+                            `The optimized kernel speedup (${evalResult.speedup?.toFixed(2)}x) is below target (${targetSpeedup}x). Please optimize further.`;
                     }
                 } else {
-                    // No evaluation reference - just accept the optimized code
-                    bestCode = optimizedCode;
-                    this._outputChannel.appendLine(`✓ Optimization complete (no evaluation reference)`);
-                    
-                    progress.report({ 
-                        message: `Attempt ${attempt}/${maxAttempts}: ✓ Optimization complete`,
-                        increment: 100 / maxAttempts
-                    });
-                    break;
+                    // Build feedback based on failure type
+                    if (!evalResult.compile_success) {
+                        feedback = `Compilation error: ${evalResult.error || 'unknown'}. Please fix the syntax and try again.`;
+                        lastError = evalResult.error || 'Compilation failed';
+                    } else {
+                        feedback = `Accuracy check failed (max_diff=${evalResult.max_diff?.toFixed(6)}). ` +
+                            `The optimized kernel must produce the same output as the baseline kernel.`;
+                        lastError = evalResult.error || 
+                            (evalResult.has_nan ? 'Output contains NaN' : 
+                             evalResult.has_inf ? 'Output contains Inf' : 
+                             `Max diff too high: ${evalResult.max_diff}`);
+                    }
                 }
+            }
+            
+            // Select best result from all attempts
+            // Filter: accuracy must pass, then pick highest speedup
+            const validResults = allResults.filter(r => r.eval.compile_success && r.eval.accuracy_pass);
+            
+            this._outputChannel.appendLine(`\n--- Results Summary ---`);
+            this._outputChannel.appendLine(`Total attempts: ${maxAttempts}`);
+            this._outputChannel.appendLine(`Valid results (accuracy pass): ${validResults.length}`);
+            
+            if (validResults.length > 0) {
+                // Sort by speedup descending
+                validResults.sort((a, b) => (b.eval.speedup || 0) - (a.eval.speedup || 0));
+                
+                // Log all valid results
+                validResults.forEach((r, i) => {
+                    this._outputChannel.appendLine(`  ${i + 1}. Speedup: ${r.eval.speedup?.toFixed(2)}x`);
+                });
+                
+                // Pick the best one
+                bestCode = validResults[0].code;
+                bestEval = validResults[0].eval;
+                this._outputChannel.appendLine(`\n✓ Selected best result: ${bestEval.speedup?.toFixed(2)}x speedup`);
+            } else if (allResults.length > 0) {
+                // No valid results, keep the last one for debugging
+                bestCode = allResults[allResults.length - 1].code;
+                bestEval = allResults[allResults.length - 1].eval;
+                this._outputChannel.appendLine(`⚠ No valid results, keeping last attempt for debugging`);
             }
 
             // Return result
@@ -585,13 +614,158 @@ export class PythonBackend {
             };
         } finally {
             // Cleanup
-            this._cleanup(inputCodeFile);
-            if (problemFile) {
-                this._cleanup(problemFile);
-            }
+            this._cleanup(baselineCodeFile);
             try {
                 fs.rmSync(outputDir, { recursive: true, force: true });
             } catch {}
+        }
+    }
+    
+    /**
+     * Build feedback for triton2triton optimization
+     */
+    private _buildTritonOptimizeFeedback(evalResult: any): string {
+        const parts: string[] = [];
+        parts.push('=== BASELINE KERNEL ANALYSIS ===');
+        
+        if (evalResult.baseline_time_ms) {
+            parts.push(`Baseline execution time: ${evalResult.baseline_time_ms.toFixed(3)} ms`);
+        }
+        
+        parts.push('\n=== OPTIMIZATION GOALS ===');
+        parts.push('1. Maintain numerical accuracy (output must match baseline)');
+        parts.push('2. Improve execution time compared to baseline');
+        
+        parts.push('\n=== MI350 OPTIMIZATION TECHNIQUES ===');
+        parts.push('- XCD Swizzle (32 XCDs): Remap block IDs for better distribution');
+        parts.push('- L2 Cache Grouping (GROUP_M=8): Group tiles for cache locality');
+        parts.push('- MFMA: Use matrix_instr_nonkdim=16 for 16x16 instructions');
+        parts.push('- Block sizes: Try 128x128x64 or 256x128x64 for GEMM');
+        parts.push('- Environment: TRITON_HIP_USE_BLOCK_PINGPONG=1, TRITON_HIP_USE_ASYNC_COPY=1');
+        
+        return parts.join('\n');
+    }
+    
+    /**
+     * Profile baseline Triton kernel (run and get performance)
+     */
+    private async _evaluateTritonBaseline(
+        codeFile: string,
+        baselineClass: string,
+        pythonPath: string,
+        hipGeneratorPath: string
+    ): Promise<EvaluationResult & { baseline_time_ms?: number; profiler_feedback?: string }> {
+        const resultFile = path.join(this._tempDir, `baseline_result_${Date.now()}.json`);
+        
+        this._outputChannel.appendLine(`Profiling baseline kernel: ${baselineClass}`);
+        
+        try {
+            const evalScript = path.join(hipGeneratorPath, 'eval.py');
+            // Use triton-optimize mode with same file as both baseline and optimized
+            // This just runs the baseline kernel to get timing
+            const args = [
+                evalScript,
+                '--triton-optimize',
+                '--code', codeFile,
+                '--problem', codeFile,  // Same file (contains get_inputs)
+                '--baseline-code', codeFile,
+                '--baseline-class', baselineClass,
+                '--optimized-class', baselineClass,  // Same class (just timing)
+                '--output', resultFile,
+                '--profile'
+            ];
+
+            const config = vscode.workspace.getConfiguration('hipGenerator');
+            const apiKey = config.get<string>('amdApiKey');
+
+            await this._runPython(pythonPath, args, {
+                LLM_GATEWAY_KEY: apiKey || '',
+                PYTORCH_ROCM_ARCH: 'gfx950'
+            });
+
+            if (fs.existsSync(resultFile)) {
+                let jsonContent = fs.readFileSync(resultFile, 'utf-8');
+                jsonContent = this._fixJsonSpecialValues(jsonContent);
+                const evalResult = JSON.parse(jsonContent);
+                return {
+                    ...evalResult,
+                    baseline_time_ms: evalResult.baseline_time_ms || evalResult.ref_time_ms,
+                    profiler_feedback: evalResult.profiler_feedback
+                };
+            }
+            
+            return {
+                ...this._failedEvaluation('Baseline profiling failed'),
+                baseline_time_ms: undefined
+            };
+        } catch (error: any) {
+            return {
+                ...this._failedEvaluation(error.message),
+                baseline_time_ms: undefined
+            };
+        } finally {
+            this._cleanup(resultFile);
+        }
+    }
+    
+    /**
+     * Evaluate optimized kernel vs baseline (triton2triton)
+     */
+    private async _evaluateTritonOptimize(
+        baselineCodeFile: string,
+        optimizedCodeFile: string,
+        baselineClass: string,
+        optimizedClass: string,
+        pythonPath: string,
+        hipGeneratorPath: string
+    ): Promise<EvaluationResult & { profiler_feedback?: string }> {
+        const resultFile = path.join(this._tempDir, `triton_opt_result_${Date.now()}.json`);
+        
+        this._outputChannel.appendLine(`Evaluating: ${optimizedClass} vs baseline ${baselineClass}`);
+        
+        try {
+            const evalScript = path.join(hipGeneratorPath, 'eval.py');
+            const args = [
+                evalScript,
+                '--triton-optimize',
+                '--code', optimizedCodeFile,
+                '--problem', baselineCodeFile,  // Baseline file has get_inputs
+                '--baseline-code', baselineCodeFile,
+                '--baseline-class', baselineClass,
+                '--optimized-class', optimizedClass,
+                '--output', resultFile,
+                '--profile'
+            ];
+
+            const config = vscode.workspace.getConfiguration('hipGenerator');
+            const apiKey = config.get<string>('amdApiKey');
+
+            await this._runPython(pythonPath, args, {
+                LLM_GATEWAY_KEY: apiKey || '',
+                PYTORCH_ROCM_ARCH: 'gfx950'
+            });
+
+            if (fs.existsSync(resultFile)) {
+                let jsonContent = fs.readFileSync(resultFile, 'utf-8');
+                jsonContent = this._fixJsonSpecialValues(jsonContent);
+                const evalResult = JSON.parse(jsonContent);
+                return {
+                    ...evalResult,
+                    profiler_feedback: evalResult.profiler_feedback
+                };
+            }
+            
+            return {
+                ...this._failedEvaluation('Evaluation failed - no result file'),
+                profiler_feedback: undefined
+            };
+        } catch (error: any) {
+            return {
+                ...this._failedEvaluation(error.message),
+                profiler_feedback: undefined
+            };
+        } finally {
+            this._cleanup(resultFile);
         }
     }
 
@@ -980,9 +1154,17 @@ export class PythonBackend {
     }
 
     private _getHipGeneratorPath(): string | null {
+        // Check paths in order of preference:
+        // 1. Bundled within extension (for packaged vsix)
+        // 2. Parent directory (for development)
+        // 3. Common installation paths
         const possiblePaths = [
+            // Bundled in extension's hipgenerator folder
+            path.join(this._context.extensionPath, 'hipgenerator'),
+            // Parent directory (development mode)
             path.join(this._context.extensionPath, '..'),
             path.join(__dirname, '..', '..', '..'),
+            // Fallback to common paths
             '/root/HipGenerator',
             process.cwd()
         ];
@@ -990,9 +1172,13 @@ export class PythonBackend {
         for (const p of possiblePaths) {
             const generatePy = path.join(p, 'generate.py');
             if (fs.existsSync(generatePy)) {
+                this._outputChannel.appendLine(`Found HipGenerator at: ${p}`);
                 return p;
             }
         }
+        
+        this._outputChannel.appendLine('ERROR: HipGenerator not found. Searched paths:');
+        possiblePaths.forEach(p => this._outputChannel.appendLine(`  - ${p}`));
 
         return null;
     }
@@ -1000,7 +1186,8 @@ export class PythonBackend {
     private async _runPython(
         pythonPath: string,
         args: string[],
-        env: Record<string, string>
+        env: Record<string, string>,
+        timeoutMs: number = 300000  // 5 min default timeout
     ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
         return new Promise((resolve) => {
             const proc = cp.spawn(pythonPath, args, {
@@ -1010,6 +1197,14 @@ export class PythonBackend {
 
             let stdout = '';
             let stderr = '';
+            let killed = false;
+
+            // Set timeout
+            const timeout = setTimeout(() => {
+                killed = true;
+                proc.kill('SIGKILL');
+                this._outputChannel.appendLine(`\n⚠ Process killed after ${timeoutMs / 1000}s timeout`);
+            }, timeoutMs);
 
             proc.stdout.on('data', (data) => {
                 const text = data.toString();
@@ -1024,14 +1219,16 @@ export class PythonBackend {
             });
 
             proc.on('close', (code) => {
+                clearTimeout(timeout);
                 resolve({
-                    exitCode: code || 0,
+                    exitCode: killed ? 124 : (code || 0),  // 124 = timeout
                     stdout,
-                    stderr
+                    stderr: killed ? 'Process killed due to timeout' : stderr
                 });
             });
 
             proc.on('error', (error) => {
+                clearTimeout(timeout);
                 resolve({
                     exitCode: 1,
                     stdout,
