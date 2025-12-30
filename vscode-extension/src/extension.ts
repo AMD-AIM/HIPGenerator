@@ -331,8 +331,9 @@ async function handleOptimizeTriton(context: vscode.ExtensionContext) {
         originalCode = modelMatch[0];
         
         // Extract get_inputs and get_init_inputs
-        const getInputsMatch = fullDocumentCode.match(/def\s+get_inputs\s*\(\s*\)[\s\S]*?(?=\ndef\s|\nclass\s|$)/);
-        const getInitInputsMatch = fullDocumentCode.match(/def\s+get_init_inputs\s*\(\s*\)[\s\S]*?(?=\ndef\s|\nclass\s|$)/);
+        // Stop at: next function, class, or comment block (# ===)
+        const getInputsMatch = fullDocumentCode.match(/def\s+get_inputs\s*\(\s*\)[\s\S]*?(?=\ndef\s|\nclass\s|\n#\s*={3,}|$)/);
+        const getInitInputsMatch = fullDocumentCode.match(/def\s+get_init_inputs\s*\(\s*\)[\s\S]*?(?=\ndef\s|\nclass\s|\n#\s*={3,}|$)/);
         
         if (getInputsMatch) {
             getInputs = getInputsMatch[0].trim();
