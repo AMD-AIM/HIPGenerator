@@ -203,14 +203,41 @@ def detect_cheating(code_path: str, backend: str = "triton") -> dict:
     # Look for @triton.jit followed by def without ): ending the parameter list
     jit_sections = re.split(r'@triton\.jit', code)[1:]  # Skip everything before first @triton.jit
     for section in jit_sections:
-        # Find the def statement
+        # Find the def statement immediately following @triton.jit
         def_match = re.match(r'\s*\ndef\s+(\w+)\s*\(', section)
         if def_match:
             kernel_name = def_match.group(1)
-            # Check if there's a proper function definition with ):
-            # The pattern should be: def name(...): followed by indented body
-            proper_def = re.search(r'def\s+\w+\s*\([^)]*\)\s*:', section)
-            if not proper_def:
+            
+            # CRITICAL: Check if the KERNEL's parameter list closes BEFORE class definition
+            # This catches cases where the function definition is malformed:
+            # def kernel(       <- @triton.jit decorated
+            #     param,
+            #     code_line     <- should be in body, not parameters!
+            # class ModelNew:   <- class starts before ): found
+            
+            # Find where ): occurs (parameter list end)
+            param_close_match = re.search(r'\)\s*:', section[:1000])  # Look in first 1000 chars
+            # Find where class definition starts
+            class_start_match = re.search(r'\nclass\s+', section)
+            
+            if param_close_match:
+                param_close_pos = param_close_match.start()
+            else:
+                param_close_pos = float('inf')
+            
+            if class_start_match:
+                class_start_pos = class_start_match.start()
+            else:
+                class_start_pos = float('inf')
+            
+            # If class appears BEFORE the parameter list closes, the kernel is malformed
+            if class_start_pos < param_close_pos:
+                result["is_cheating"] = True
+                result["cheating_reason"] = f"CHEATING DETECTED: Kernel '{kernel_name}' has malformed definition - 'class' appears before '):', indicating code was put in parameter list instead of body"
+                return result
+            
+            # Also check: if no ): found at all in a reasonable range, it's malformed
+            if param_close_pos == float('inf'):
                 result["is_cheating"] = True
                 result["cheating_reason"] = f"CHEATING DETECTED: Kernel '{kernel_name}' has malformed function definition (missing '):')"
                 return result
