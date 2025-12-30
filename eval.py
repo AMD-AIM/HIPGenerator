@@ -184,10 +184,52 @@ def detect_cheating(code_path: str, backend: str = "triton") -> dict:
     # If no ModelNew class found, skip this check (will fail later anyway)
     
     # =====================================================
-    # CHECK 2: Empty or incomplete Triton kernels
+    # CHECK 2: Malformed @triton.autotune decorator
     # =====================================================
+    # Check for @triton.autotune without proper closing )
+    autotune_blocks = re.findall(r'@triton\.autotune\s*\((.*?)(?=@triton\.jit|def\s+\w+)', code, re.DOTALL)
+    for block in autotune_blocks:
+        # Count parentheses - should be balanced
+        open_parens = block.count('(')
+        close_parens = block.count(')')
+        if open_parens > close_parens:
+            result["is_cheating"] = True
+            result["cheating_reason"] = "CHEATING DETECTED: @triton.autotune decorator is malformed (missing closing parenthesis)"
+            return result
+    
+    # =====================================================
+    # CHECK 3: Kernel function definition without proper ):
+    # =====================================================
+    # Look for @triton.jit followed by def without ): ending the parameter list
+    jit_sections = re.split(r'@triton\.jit', code)[1:]  # Skip everything before first @triton.jit
+    for section in jit_sections:
+        # Find the def statement
+        def_match = re.match(r'\s*\ndef\s+(\w+)\s*\(', section)
+        if def_match:
+            kernel_name = def_match.group(1)
+            # Check if there's a proper function definition with ):
+            # The pattern should be: def name(...): followed by indented body
+            proper_def = re.search(r'def\s+\w+\s*\([^)]*\)\s*:', section)
+            if not proper_def:
+                result["is_cheating"] = True
+                result["cheating_reason"] = f"CHEATING DETECTED: Kernel '{kernel_name}' has malformed function definition (missing '):')"
+                return result
+    
+    # =====================================================
+    # CHECK 4: Empty or incomplete Triton kernels
+    # =====================================================
+    # Find all properly defined kernels
     kernel_pattern = r'@triton\.jit\s*\ndef\s+(\w+)\s*\([^)]*\)\s*:\s*\n(.*?)(?=\n@|\nclass\s|\ndef\s|\Z)'
     kernels = re.findall(kernel_pattern, code, re.DOTALL)
+    
+    # Also count @triton.jit occurrences
+    triton_jit_count = len(re.findall(r'@triton\.jit', code))
+    
+    # If we have @triton.jit but couldn't parse any complete kernels, that's suspicious
+    if triton_jit_count > 0 and len(kernels) == 0:
+        result["is_cheating"] = True
+        result["cheating_reason"] = "CHEATING DETECTED: @triton.jit found but no complete kernel definitions (check for syntax errors)"
+        return result
     
     for kernel_name, kernel_body in kernels:
         # Check if kernel body is essentially empty or just has return
@@ -203,30 +245,14 @@ def detect_cheating(code_path: str, backend: str = "triton") -> dict:
             result["cheating_reason"] = f"CHEATING DETECTED: Kernel '{kernel_name}' has incomplete implementation (< 3 lines)"
             return result
         
-        if not has_tl_load and not has_tl_store:
-            result["warnings"].append(f"Kernel '{kernel_name}' has no tl.load or tl.store - may be incomplete")
-    
-    # =====================================================
-    # CHECK 3: Kernel function definition issues
-    # =====================================================
-    # Check for missing closing parenthesis in kernel definitions
-    # This regex looks for @triton.jit followed by def without a complete signature
-    # A proper kernel should have: @triton.jit ... def name(...): with the colon
-    kernel_defs = re.findall(r'@triton\.jit\s*\ndef\s+(\w+)\s*\(([^)]*)\)\s*:', code, re.DOTALL)
-    triton_jit_count = len(re.findall(r'@triton\.jit', code))
-    
-    # If we have @triton.jit decorators but can't find matching function definitions with ):
-    # then the definition might be malformed
-    if triton_jit_count > len(kernel_defs):
-        # Check specifically for incomplete signatures (common LLM mistake)
-        incomplete = re.search(r'@triton\.jit\s*\ndef\s+\w+\s*\([^)]*\n[^)]*[^:\)]\s*\n', code)
-        if incomplete:
+        # CRITICAL: A real kernel must have both tl.load AND tl.store
+        if not has_tl_load or not has_tl_store:
             result["is_cheating"] = True
-            result["cheating_reason"] = "CHEATING DETECTED: Kernel function definition is incomplete (missing closing parenthesis or colon)"
+            result["cheating_reason"] = f"CHEATING DETECTED: Kernel '{kernel_name}' is incomplete - missing {'tl.load' if not has_tl_load else 'tl.store'}"
             return result
     
     # =====================================================
-    # CHECK 4: No Triton kernels defined at all
+    # CHECK 5: No Triton kernels defined at all
     # =====================================================
     if '@triton.jit' not in code and backend == "triton":
         result["is_cheating"] = True
@@ -620,7 +646,21 @@ def evaluate(problem_path: str, code_path: str, run_profiler: bool = False, back
     }
     
     try:
-        # Load reference
+        # Check for cheating FIRST (before any loading) - this works on raw file content
+        print(f"Checking for cheating patterns in: {code_path}")
+        cheat_check = detect_cheating(code_path, backend=backend)
+        if cheat_check["is_cheating"]:
+            result["error"] = cheat_check["cheating_reason"]
+            result["compile_success"] = False
+            result["accuracy_pass"] = False
+            print(f"❌ {cheat_check['cheating_reason']}")
+            return result
+        
+        if cheat_check["warnings"]:
+            for warning in cheat_check["warnings"]:
+                print(f"⚠️ Warning: {warning}")
+        
+        # Load reference (use separate file if problem_path != code_path)
         print(f"Loading problem: {problem_path}")
         ref_module = load_problem_module(problem_path)
         
@@ -636,20 +676,6 @@ def evaluate(problem_path: str, code_path: str, run_profiler: bool = False, back
         if not Model or not get_inputs:
             result["error"] = f"Problem file missing {ref_class_name}/Model or get_inputs"
             return result
-        
-        # Check for cheating BEFORE loading code
-        print(f"Checking for cheating patterns in: {code_path}")
-        cheat_check = detect_cheating(code_path, backend=backend)
-        if cheat_check["is_cheating"]:
-            result["error"] = cheat_check["cheating_reason"]
-            result["compile_success"] = False
-            result["accuracy_pass"] = False
-            print(f"❌ {cheat_check['cheating_reason']}")
-            return result
-        
-        if cheat_check["warnings"]:
-            for warning in cheat_check["warnings"]:
-                print(f"⚠️ Warning: {warning}")
         
         # Load generated code
         print(f"Loading generated code: {code_path} (backend={backend})")
