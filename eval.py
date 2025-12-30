@@ -236,9 +236,15 @@ def detect_cheating(code_path: str, backend: str = "triton") -> dict:
         stripped_body = kernel_body.strip()
         lines = [l.strip() for l in stripped_body.split('\n') if l.strip() and not l.strip().startswith('#')]
         
-        # Count meaningful operations
-        has_tl_load = 'tl.load' in kernel_body
-        has_tl_store = 'tl.store' in kernel_body
+        # Remove comments from kernel body for accurate checking
+        # This prevents false positives from comments like "# Missing: tl.store(...)"
+        code_without_comments = '\n'.join(
+            line.split('#')[0] for line in kernel_body.split('\n')
+        )
+        
+        # Count meaningful operations (excluding comments)
+        has_tl_load = 'tl.load' in code_without_comments
+        has_tl_store = 'tl.store' in code_without_comments
         
         if len(lines) < 3:  # Too short to be a real kernel
             result["is_cheating"] = True
