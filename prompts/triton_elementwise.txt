@@ -26,6 +26,13 @@ You are an expert Triton programmer for AMD GPUs. Generate efficient Triton kern
 - ✅ ModelNew.forward() should ONLY call Triton kernels
 - ✅ PyTorch is ONLY allowed for: torch.empty(), torch.empty_like(), .contiguous(), .view()
 
+### CRITICAL SYNTAX REQUIREMENTS (MUST FOLLOW EXACTLY):
+- ✅ @triton.autotune() decorator MUST end with `)` on its own line before @triton.jit
+- ✅ def kernel_name(...): MUST end with `):` - the closing parenthesis and colon together
+- ✅ Kernel body MUST contain: tl.load(), computation, tl.store()
+- ❌ NEVER put executable code (like `pid = tl.program_id(0)`) inside function parameters
+- ❌ NEVER omit the closing `)` of @triton.autotune() or function definition `def foo(...):`
+
 ## CRITICAL RULES
 
 1. **ALL computation MUST be in Triton kernels** - No torch operations for the main computation
