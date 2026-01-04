@@ -2,7 +2,9 @@
   "description": "Prompt configuration for HipKittens/Triton kernel generation",
   
   "default_prompt": "hipkittens_base.txt",
-  "triton_default_prompt": "triton_elementwise.txt",
+  "triton_default_prompt": "triton_high_performance.txt",
+  "triton_correctness_prompt": "triton_high_correctness.txt",
+  "triton_performance_prompt": "triton_high_performance.txt",
   
   "patterns": {
     "matmul|matrix_mult|gemm|mm_|square.*matrix|standard.*matrix": "hipkittens_gemm.txt",
@@ -26,12 +28,13 @@
     "linear|fc|dense|mlp": "triton_gemm_mi350_golden.txt",
     "transposed": "triton_gemm_mi350_golden.txt",
     
-    "relu|sigmoid|tanh|gelu|selu|elu|softplus|softsign|leaky|hard|silu|swish|mish": "triton_elementwise.txt",
-    "softmax|logsoftmax": "triton_elementwise.txt",
-    "layernorm|batchnorm|groupnorm|instancenorm|rmsnorm": "triton_elementwise.txt",
-    "norm_|frobenius|l1norm|l2norm": "triton_elementwise.txt",
-    "pool|max_|mean_|sum_|argmax|argmin|min_|cumprod": "triton_elementwise.txt",
-    "scalar": "triton_elementwise.txt"
+    "relu|sigmoid|tanh|gelu|selu|elu|softplus|softsign|leaky|hard|silu|swish|mish|newgelu": "triton_elementwise_optimized.txt",
+    "softmax|logsoftmax": "triton_softmax.txt",
+    "layernorm|batchnorm|groupnorm|instancenorm|rmsnorm": "triton_norm.txt",
+    "norm_|frobenius|l1norm|l2norm": "triton_norm.txt",
+    "pool|pooling|maxpool|avgpool": "triton_pooling.txt",
+    "sum_|mean_|max_|min_|argmax|argmin|reduction": "triton_reduction.txt",
+    "scalar": "triton_elementwise_optimized.txt"
   },
   
   "triton_level2_patterns": {

@@ -31,16 +31,27 @@ def repair_triton_code(code: str) -> str:
     """Repair Triton code by injecting missing optimizations.
     
     This function checks for critical MI350 optimizations and injects them if missing:
-    1. XCD swizzle (critical for 32 XCDs on MI350)
-    2. Environment variables for pingpong/async copy
-    3. matrix_instr_nonkdim=16 for MFMA
+    1. Environment variables for pingpong/async copy
+    2. XCD swizzle (ONLY for GEMM/matmul, NOT for element-wise ops)
+    3. matrix_instr_nonkdim=16 for MFMA (ONLY for GEMM/matmul)
     """
     import re
     
     repaired = code
     changes_made = []
     
-    # Check and add environment variables at the top after imports
+    # Detect if this is a GEMM/matmul kernel vs element-wise
+    code_lower = code.lower()
+    is_gemm = any(op in code_lower for op in [
+        'tl.dot(', 'matmul', 'gemm', 'mm(', 'linear',
+        'stride_am', 'stride_bk', 'block_m', 'block_n', 'block_k'
+    ])
+    is_elementwise = any(op in code_lower for op in [
+        'relu', 'sigmoid', 'gelu', 'tanh', 'swish', 'silu', 'softmax',
+        'exp(', 'log(', 'sqrt(', 'maximum(', 'minimum('
+    ]) and not is_gemm
+    
+    # Check and add environment variables at the top after imports (for all kernels)
     if "TRITON_HIP_USE_BLOCK_PINGPONG" not in repaired:
         # Find first import line and add after it
         import_match = re.search(r'^import\s+\w+', repaired, re.MULTILINE)
@@ -50,21 +61,32 @@ def repair_triton_code(code: str) -> str:
             repaired = repaired[:insert_pos] + env_code + repaired[insert_pos:]
             changes_made.append("Added TRITON_HIP_USE_BLOCK_PINGPONG and ASYNC_COPY")
     
-    # Check and add XCD swizzle if missing
-    if "NUM_XCDS" not in repaired and "pids_per_xcd" not in repaired:
-        # Add NUM_XCDS constant if not present
-        if "NUM_XCDS" not in repaired:
-            # Find a good place to insert (after os.environ lines or before @triton.jit)
-            jit_match = re.search(r'^@triton\.jit', repaired, re.MULTILINE)
-            if jit_match:
-                repaired = repaired[:jit_match.start()] + "NUM_XCDS = 32\n\n" + repaired[jit_match.start():]
-                changes_made.append("Added NUM_XCDS = 32")
-        
-        # Now inject XCD swizzle into kernel after pid calculation
-        # Look for the pattern: pid = tl.program_id(0)
-        pid_pattern = r'(pid\s*=\s*tl\.program_id\(0\))'
-        
-        xcd_swizzle = '''\\1
+    # XCD swizzle is ONLY for GEMM/matmul kernels, NOT for element-wise
+    if is_gemm and not is_elementwise:
+        # Check and add XCD swizzle if missing
+        if "NUM_XCDS" not in repaired and "pids_per_xcd" not in repaired:
+            # Add NUM_XCDS constant before @triton.jit (NOT between decorators!)
+            if "NUM_XCDS" not in repaired:
+                # Find position BEFORE @triton.autotune or @triton.jit
+                autotune_match = re.search(r'^@triton\.autotune', repaired, re.MULTILINE)
+                jit_match = re.search(r'^@triton\.jit', repaired, re.MULTILINE)
+                
+                if autotune_match:
+                    insert_pos = autotune_match.start()
+                elif jit_match:
+                    insert_pos = jit_match.start()
+                else:
+                    insert_pos = None
+                
+                if insert_pos is not None:
+                    repaired = repaired[:insert_pos] + "NUM_XCDS = 32\n\n" + repaired[insert_pos:]
+                    changes_made.append("Added NUM_XCDS = 32")
+            
+            # Only inject XCD swizzle if BLOCK_M and BLOCK_N are present (GEMM kernel)
+            if "BLOCK_M" in repaired and "BLOCK_N" in repaired:
+                pid_pattern = r'(pid\s*=\s*tl\.program_id\(0\))'
+                
+                xcd_swizzle = '''\\1
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
     num_pids = num_pid_m * num_pid_n
@@ -77,36 +99,32 @@ def repair_triton_code(code: str) -> str:
         remapped_pid = xcd_id * pids_per_xcd + local_pid
         if remapped_pid < num_pids:
             pid = remapped_pid'''
+                
+                if re.search(pid_pattern, repaired):
+                    # Check if num_pid_m already defined after pid
+                    if "num_pid_m" not in repaired:
+                        repaired = re.sub(pid_pattern, xcd_swizzle, repaired, count=1)
+                        changes_made.append("Injected XCD swizzle")
         
-        if re.search(pid_pattern, repaired):
-            # Check if num_pid_m already defined after pid
-            if "num_pid_m" in repaired:
-                # XCD swizzle code needs to be inserted between pid and num_pid_m
-                # More complex insertion - find where to put XCD logic
-                pass  # Skip if already has grouping logic
-            else:
-                repaired = re.sub(pid_pattern, xcd_swizzle, repaired, count=1)
-                changes_made.append("Injected XCD swizzle")
-    
-    # Check and add matrix_instr_nonkdim=16 if missing
-    if "matrix_instr_nonkdim" not in repaired:
-        # Find kernel launch pattern and add the parameter
-        launch_patterns = [
-            r'(kernel\[.*?\]\(.*?num_warps\s*=\s*\d+)',
-            r'(matmul_kernel\[.*?\]\(.*?num_warps\s*=\s*\d+)',
-            r'(\w+_kernel\[.*?\]\(.*?num_warps\s*=\s*\d+)',
-        ]
-        for pattern in launch_patterns:
-            if re.search(pattern, repaired, re.DOTALL):
-                repaired = re.sub(
-                    pattern + r'(\s*,?\s*\))',
-                    r'\1, matrix_instr_nonkdim=16\2',
-                    repaired,
-                    count=1,
-                    flags=re.DOTALL
-                )
-                changes_made.append("Added matrix_instr_nonkdim=16")
-                break
+        # Check and add matrix_instr_nonkdim=16 if missing (GEMM only)
+        if "matrix_instr_nonkdim" not in repaired:
+            # Find kernel launch pattern and add the parameter
+            launch_patterns = [
+                r'(kernel\[.*?\]\(.*?num_warps\s*=\s*\d+)',
+                r'(matmul_kernel\[.*?\]\(.*?num_warps\s*=\s*\d+)',
+                r'(\w+_kernel\[.*?\]\(.*?num_warps\s*=\s*\d+)',
+            ]
+            for pattern in launch_patterns:
+                if re.search(pattern, repaired, re.DOTALL):
+                    repaired = re.sub(
+                        pattern + r'(\s*,?\s*\))',
+                        r'\1, matrix_instr_nonkdim=16\2',
+                        repaired,
+                        count=1,
+                        flags=re.DOTALL
+                    )
+                    changes_made.append("Added matrix_instr_nonkdim=16")
+                    break
     
     if changes_made:
         print(f"  Code repaired: {', '.join(changes_made)}")
@@ -114,9 +132,13 @@ def repair_triton_code(code: str) -> str:
     return repaired
 
 
-def run_generate(problem_path: str, output_path: str, num_samples: int = 3, 
-                 feedback: str = None, attempt: int = 1, backend: str = "hip") -> list:
-    """Run generate.py and return paths to generated samples."""
+def run_generate(problem_path: str, output_path: str,
+                 feedback: str = None, attempt: int = 1, backend: str = "hip") -> str:
+    """Run generate.py and return path to generated code.
+    
+    Returns:
+        Path to generated code file, or None if generation failed.
+    """
     script_dir = Path(__file__).parent
     
     # Build user feedback if provided
@@ -151,8 +173,8 @@ def run_generate(problem_path: str, output_path: str, num_samples: int = 3,
         sys.executable, str(script_dir / "generate.py"),
         "--problem", problem_path,
         "--output", output_path,
-        "--num-samples", str(num_samples),
-        "--temperature", "0.3",  # Higher temp for diversity
+        "--num-samples", "1",  # Always generate 1 sample per attempt
+        "--temperature", "0.1",  # Lower temp for more deterministic output
         "--backend", backend,
     ]
     if prompt_file:
@@ -170,39 +192,27 @@ def run_generate(problem_path: str, output_path: str, num_samples: int = 3,
     
     if result.returncode != 0:
         print(f"Generation failed with return code {result.returncode}")
-        return []
+        return None
     
-    # Find generated sample files
-    output_dir = Path(output_path).parent
-    base_name = Path(output_path).stem
-    samples = []
-    
-    # First check for the main file (samples=1 case)
-    main_file = Path(output_path)
-    if main_file.exists() and main_file.stat().st_size > 0:
-        samples.append(str(main_file))
-    
-    # Then check for _s{i} files (samples>1 case)
-    for i in range(1, num_samples + 1):
-        sample_path = output_dir / f"{base_name}_s{i}.py"
-        if sample_path.exists() and str(sample_path) not in samples:
-            samples.append(str(sample_path))
+    # Check if output file exists
+    if not Path(output_path).exists() or Path(output_path).stat().st_size == 0:
+        print("No code generated")
+        return None
     
     # Repair Triton code if needed (inject XCD swizzle, etc.)
     if backend == "triton":
-        for sample_path in samples:
-            try:
-                with open(sample_path, 'r') as f:
-                    code = f.read()
-                repaired_code = repair_triton_code(code)
-                if repaired_code != code:
-                    with open(sample_path, 'w') as f:
-                        f.write(repaired_code)
-            except Exception as e:
-                print(f"  Warning: Could not repair {sample_path}: {e}")
+        try:
+            with open(output_path, 'r') as f:
+                code = f.read()
+            repaired_code = repair_triton_code(code)
+            if repaired_code != code:
+                with open(output_path, 'w') as f:
+                    f.write(repaired_code)
+        except Exception as e:
+            print(f"  Warning: Could not repair code: {e}")
     
-    print(f"Generated {len(samples)} samples")
-    return samples
+    print(f"Generated: {output_path}")
+    return output_path
 
 
 def run_evaluate(code_path: str, problem_path: str, output_path: str, backend: str = "hip", 
@@ -237,13 +247,106 @@ def run_evaluate(code_path: str, problem_path: str, output_path: str, backend: s
     }
 
 
-def build_feedback(results: list, backend: str = "hip") -> str:
+def build_metrics_feedback(rocprof_metrics: dict, speedup: float, problem_type: str) -> list:
+    """Build optimization feedback based on rocprof metrics."""
+    hints = []
+    
+    if not rocprof_metrics:
+        return hints
+    
+    # Extract metrics
+    vgpr = rocprof_metrics.get("vgpr_count", 0)
+    sgpr = rocprof_metrics.get("sgpr_count", 0)
+    lds_bytes = rocprof_metrics.get("lds_usage_bytes", 0)
+    workgroup = rocprof_metrics.get("workgroup_size", [])
+    grid = rocprof_metrics.get("grid_size", [])
+    
+    # PMC counters
+    valu_insts = rocprof_metrics.get("SQ_INSTS_VALU", 0)
+    salu_insts = rocprof_metrics.get("SQ_INSTS_SALU", 0)
+    lds_conflicts = rocprof_metrics.get("SQ_LDS_BANK_CONFLICT", 0)
+    l2_hit = rocprof_metrics.get("TCC_HIT", 0)
+    l2_miss = rocprof_metrics.get("TCC_MISS", 0)
+    
+    # Calculate derived metrics
+    total_threads = workgroup[0] * workgroup[1] * workgroup[2] if len(workgroup) >= 3 else 0
+    total_blocks = grid[0] * grid[1] * grid[2] if len(grid) >= 3 else (grid[0] if grid else 0)
+    l2_hit_rate = (l2_hit / (l2_hit + l2_miss) * 100) if (l2_hit + l2_miss) > 0 else -1
+    
+    # --- VGPR/SGPR Analysis ---
+    if vgpr > 128:
+        hints.append(f"⚠ HIGH VGPR ({vgpr}): Limits occupancy. Reduce register pressure by:")
+        hints.append("   - Split complex computations into smaller kernels")
+        hints.append("   - Use fewer intermediate variables")
+        hints.append("   - Consider smaller BLOCK_SIZE")
+    elif vgpr > 0 and vgpr < 32:
+        hints.append(f"✓ LOW VGPR ({vgpr}): Good register usage, room for more computation")
+    
+    # --- Workgroup Size Analysis ---
+    if total_threads > 0 and total_threads < 256:
+        hints.append(f"⚠ SMALL WORKGROUP ({total_threads} threads): Poor occupancy")
+        hints.append("   - Increase BLOCK_SIZE to at least 256")
+        hints.append("   - Use num_warps=4 or higher")
+    
+    # --- Grid Size Analysis (MI350 has 256 CUs across 32 XCDs) ---
+    if total_blocks > 0 and total_blocks < 256:
+        hints.append(f"⚠ LOW PARALLELISM ({total_blocks} blocks < 256 CUs)")
+        hints.append("   - Consider processing more elements per kernel launch")
+        hints.append("   - Or use persistent kernel pattern")
+    
+    # --- L2 Cache Analysis ---
+    if l2_hit_rate >= 0:
+        if l2_hit_rate < 30:
+            hints.append(f"⚠ VERY LOW L2 HIT RATE ({l2_hit_rate:.1f}%): Memory bandwidth bottleneck")
+            hints.append("   - For GEMM: Add L2 tile grouping (GROUP_M=8)")
+            hints.append("   - Reorder memory accesses for locality")
+            hints.append("   - Consider loop tiling strategies")
+        elif l2_hit_rate < 60:
+            hints.append(f"⚠ LOW L2 HIT RATE ({l2_hit_rate:.1f}%): Consider cache optimization")
+            hints.append("   - Group tiles that share data")
+    
+    # --- LDS Analysis ---
+    if lds_bytes > 0:
+        lds_kb = lds_bytes / 1024
+        if lds_kb > 48:
+            hints.append(f"⚠ HIGH LDS USAGE ({lds_kb:.1f} KB): May limit occupancy")
+            hints.append("   - MI350 has 64KB LDS per CU, >48KB limits to 1 workgroup")
+    
+    if lds_conflicts > 0:
+        hints.append(f"⚠ LDS BANK CONFLICTS ({lds_conflicts}): Stalled cycles")
+        hints.append("   - Pad shared memory arrays to avoid conflicts")
+        hints.append("   - Use strided access patterns")
+    
+    # --- Instruction Mix Analysis ---
+    if valu_insts > 0 and salu_insts > 0:
+        valu_ratio = valu_insts / (valu_insts + salu_insts) * 100
+        if valu_ratio < 70:
+            hints.append(f"⚠ LOW VALU RATIO ({valu_ratio:.0f}%): Too much scalar overhead")
+            hints.append("   - Vectorize more operations")
+            hints.append("   - Move loop invariants outside kernel")
+    
+    return hints
+
+
+def build_feedback(results: list, backend: str = "hip", problem_type: str = "unknown") -> str:
     """Build feedback string from evaluation results with detailed profiler metrics.
     
-    This feedback is structured to help the LLM understand exactly what went wrong
-    and what specific code changes are needed based on proven golden solutions.
+    Uses rocprof_metrics for data-driven optimization suggestions rather than
+    hardcoded speedup thresholds.
+    
+    Args:
+        results: List of evaluation results
+        backend: Backend type (hip or triton)
+        problem_type: Type of problem (gemm, elementwise, softmax, norm, pooling, reduction)
     """
     feedback_parts = []
+    
+    # Detect problem category
+    is_gemm = problem_type in ["gemm", "matmul", "linear", "gemm_2d", "batched_gemm", "matvec"]
+    is_elementwise = problem_type in ["activation", "elementwise"]
+    is_softmax = problem_type == "softmax"
+    is_norm = problem_type == "norm"
+    is_reduction = problem_type in ["reduction", "pooling"]
     
     best_speedup = max((r.get("speedup", 0) for r in results if r and r.get("accuracy_pass")), default=0)
     best_result = None
@@ -329,9 +432,9 @@ def build_feedback(results: list, backend: str = "hip") -> str:
                 feedback_parts.append("FIXES for A.T @ B:")
                 feedback_parts.append("  - A is [K, M], swap strides: stride_am = A.stride(1), stride_ak = A.stride(0)")
     
-    # Handle performance issues with proven optimization techniques
+    # Handle performance issues based on rocprof metrics
     if performance_issues:
-        feedback_parts.append("\n## PERFORMANCE ANALYSIS")
+        feedback_parts.append("\n## PERFORMANCE ANALYSIS (Based on rocprof metrics)")
         
         for idx, res in performance_issues:
             speedup = res.get("speedup", 0)
@@ -341,83 +444,73 @@ def build_feedback(results: list, backend: str = "hip") -> str:
             
             feedback_parts.append(f"\nSample {idx}: {speedup:.3f}x speedup (ref={ref_time:.3f}ms, yours={new_time:.3f}ms)")
             
-            if backend == "triton":
-                if speedup < 0.5:
-                    feedback_parts.append("\n**CRITICAL: Kernel is 2x+ slower than baseline!**")
-                    feedback_parts.append("YOU MUST ADD THESE OPTIMIZATIONS:")
-                    feedback_parts.append("")
-                    feedback_parts.append("1. XCD SWIZZLE (MI350 has 32 XCDs - without this you get ~0.3x!):")
-                    feedback_parts.append("   NUM_XCDS = 32")
-                    feedback_parts.append("   pids_per_xcd = (num_pids + NUM_XCDS - 1) // NUM_XCDS")
-                    feedback_parts.append("   xcd_id = pid % NUM_XCDS")
-                    feedback_parts.append("   local_pid = pid // NUM_XCDS")
-                    feedback_parts.append("   if local_pid < pids_per_xcd:")
-                    feedback_parts.append("       remapped_pid = xcd_id * pids_per_xcd + local_pid")
-                    feedback_parts.append("       if remapped_pid < num_pids:")
-                    feedback_parts.append("           pid = remapped_pid")
-                    feedback_parts.append("")
-                    feedback_parts.append("2. Use 16x16 MFMA instructions:")
-                    feedback_parts.append("   kernel[grid](..., matrix_instr_nonkdim=16)")
-                    feedback_parts.append("")
-                    feedback_parts.append("3. Use L2 grouping:")
-                    feedback_parts.append("   num_pid_in_group = GROUP_M * num_pid_n")
-                    feedback_parts.append("   group_id = pid // num_pid_in_group")
-                    feedback_parts.append("   first_pid_m = group_id * GROUP_M")
-                    feedback_parts.append("   group_size_m = min(num_pid_m - first_pid_m, GROUP_M)")
-                    feedback_parts.append("   pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)")
-                    feedback_parts.append("   pid_n = (pid % num_pid_in_group) // group_size_m")
+            # Get metrics-based feedback
+            metrics_hints = build_metrics_feedback(rocprof, speedup, problem_type)
+            
+            if metrics_hints:
+                feedback_parts.append("\n**Profiler-based Recommendations:**")
+                feedback_parts.extend(metrics_hints)
+            
+            # Add problem-type specific tips if speedup is low
+            if speedup < 1.0 and backend == "triton":
+                feedback_parts.append(f"\n**{problem_type.upper()} Optimization Tips:**")
+                
+                if is_gemm:
+                    feedback_parts.append("• Ensure XCD swizzle for MI350 (32 XCDs)")
+                    feedback_parts.append("• Use tl.dot() with BLOCK_M=BLOCK_N=128/256")
+                    feedback_parts.append("• Add L2 grouping (GROUP_M=8)")
+                    feedback_parts.append("• Set matrix_instr_nonkdim=16 in kernel launch")
                     
-                elif speedup < 0.8:
-                    feedback_parts.append("\n**MODERATE: Need additional optimizations**")
-                    feedback_parts.append("ADD THESE:")
-                    feedback_parts.append("1. Enable pingpong at TOP of file:")
-                    feedback_parts.append("   os.environ['TRITON_HIP_USE_BLOCK_PINGPONG'] = '1'")
-                    feedback_parts.append("   os.environ['TRITON_HIP_USE_ASYNC_COPY'] = '1'")
-                    feedback_parts.append("")
-                    feedback_parts.append("2. Use optimal block sizes:")
-                    feedback_parts.append("   - For square M,N>=4096: BLOCK_M=256, BLOCK_N=256, BLOCK_K=32, stages=3, warps=8")
-                    feedback_parts.append("   - For large K>max(M,N): BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, stages=2, warps=8")
-                    feedback_parts.append("   - Set GROUP_M=8 or 16")
+                elif is_elementwise:
+                    feedback_parts.append("• Use large BLOCK_SIZE (4096-8192) with @triton.autotune")
+                    feedback_parts.append("• Avoid internal loops - vectorize entire block")
+                    feedback_parts.append("• Fast GELU: x * tl.sigmoid(1.702 * x)")
+                    feedback_parts.append("• Compute in fp32, store in fp16")
                     
-                elif speedup < 1.0:
-                    feedback_parts.append("\n**CLOSE: Need launch overhead elimination**")
-                    feedback_parts.append("MOVE THESE TO __init__:")
-                    feedback_parts.append("1. Precompute grid:")
-                    feedback_parts.append("   self._grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)")
-                    feedback_parts.append("2. Preallocate output:")
-                    feedback_parts.append("   self.register_buffer('_out', torch.empty((M, N), dtype=torch.float16))")
-                    feedback_parts.append("3. Precompute ALL strides (no .stride() in forward!):")
-                    feedback_parts.append("   self._stride_am = K; self._stride_ak = 1; ...")
+                elif is_softmax:
+                    feedback_parts.append("• Use fused single-load algorithm (BLOCK_SIZE >= row_length)")
+                    feedback_parts.append("• Single pass: load → max → exp → sum → divide → store")
+                    feedback_parts.append("• For large rows: use online softmax algorithm")
                     
-                elif speedup < 1.1:
-                    feedback_parts.append("\n**ALMOST THERE: Fine-tuning needed**")
-                    feedback_parts.append("TRY:")
-                    feedback_parts.append("1. Increase num_stages to 3 (from 2)")
-                    feedback_parts.append("2. Try GROUP_M=16 instead of 8")
-                    feedback_parts.append("3. For aligned dimensions, remove all masks for max speed")
-                else:
-                    feedback_parts.append(f"\n**GOOD: {speedup:.2f}x exceeds target!**")
+                elif is_norm:
+                    feedback_parts.append("• Process entire feature dimension in one block if possible")
+                    feedback_parts.append("• Use online algorithm for variance computation")
+                    feedback_parts.append("• Compute statistics in fp32, normalize in fp16")
+                    feedback_parts.append("• Minimize reads by fusing mean/var computation")
+                    
+                elif is_reduction:
+                    feedback_parts.append("• Use hierarchical reduction (warp → block → grid)")
+                    feedback_parts.append("• tl.sum/tl.max are already optimized for reductions")
+                    feedback_parts.append("• For large tensors: multiple kernel launches")
+                    
+            elif speedup >= 1.0:
+                feedback_parts.append(f"✓ Good performance: {speedup:.2f}x")
     
     # Overall summary
     if best_speedup > 0:
         feedback_parts.append(f"\n## SUMMARY")
-        feedback_parts.append(f"Best speedup achieved: {best_speedup:.3f}x (target: >= 1.1x)")
+        feedback_parts.append(f"Best speedup: {best_speedup:.2f}x")
         
-        if best_speedup < 1.1:
-            feedback_parts.append("\nPRIORITY ACTIONS:")
-            if best_speedup < 0.5:
-                feedback_parts.append("  1. ADD XCD swizzle code (mandatory for MI350)")
-                feedback_parts.append("  2. ADD matrix_instr_nonkdim=16 to kernel launch")
-                feedback_parts.append("  3. Use tl.dot() for matrix multiply")
-            elif best_speedup < 0.8:
-                feedback_parts.append("  1. Set TRITON_HIP_USE_BLOCK_PINGPONG='1' at file top")
-                feedback_parts.append("  2. Use optimal block sizes from table")
-            elif best_speedup < 1.0:
-                feedback_parts.append("  1. Move grid/stride computation to __init__")
-                feedback_parts.append("  2. Use register_buffer for output")
-            else:
-                feedback_parts.append("  1. Try num_stages=3, GROUP_M=16")
-                feedback_parts.append("  2. Fuse any post-GEMM ops")
+        if best_speedup >= 1.0:
+            feedback_parts.append("✓ Target achieved! Focus on further optimization if needed.")
+        else:
+            feedback_parts.append(f"Target not met. Review profiler recommendations above.")
+            
+            # Include best result's rocprof summary if available
+            if best_result and best_result.get("rocprof_metrics"):
+                rm = best_result["rocprof_metrics"]
+                summary_items = []
+                if rm.get("vgpr_count"):
+                    summary_items.append(f"VGPR={rm['vgpr_count']}")
+                if rm.get("TCC_HIT") and rm.get("TCC_MISS"):
+                    hr = rm["TCC_HIT"] / (rm["TCC_HIT"] + rm["TCC_MISS"]) * 100
+                    summary_items.append(f"L2={hr:.0f}%")
+                if rm.get("workgroup_size"):
+                    ws = rm["workgroup_size"]
+                    if len(ws) >= 3:
+                        summary_items.append(f"WG={ws[0]*ws[1]*ws[2]}")
+                if summary_items:
+                    feedback_parts.append(f"Key metrics: {', '.join(summary_items)}")
     elif not compile_errors and not accuracy_failures:
         feedback_parts.append("\nNo successful samples - check compile/accuracy errors above")
     
@@ -427,17 +520,34 @@ def build_feedback(results: list, backend: str = "hip") -> str:
     return "\n".join(feedback_parts)
 
 
-def run_loop(problem_path: str, output_dir: str, max_attempts: int = 3, 
-             samples_per_attempt: int = 3, target_speedup: float = 0.9,
-             backend: str = "hip") -> dict:
-    """Run the complete generate-evaluate-profile loop."""
+def run_loop(problem_path: str, output_dir: str, max_attempts: int = 3,
+             target_speedup: float = 0.9, backend: str = "hip") -> dict:
+    """Run the complete generate-evaluate-profile loop.
+    
+    Args:
+        problem_path: Path to the problem file
+        output_dir: Output directory for results
+        max_attempts: Maximum number of generate-evaluate attempts
+        target_speedup: Target speedup to achieve (default 0.9x)
+        backend: Backend type ('hip' or 'triton')
+        
+    Returns:
+        Dictionary with results
+    """
+    from generate import classify_problem
     
     problem_name = Path(problem_path).stem
     problem_dir = Path(output_dir) / problem_name
     problem_dir.mkdir(parents=True, exist_ok=True)
     
+    # Load and classify problem
+    with open(problem_path, 'r') as f:
+        problem_code = f.read()
+    problem_type = classify_problem(problem_name, problem_code)
+    
     print(f"\n{'#'*70}")
     print(f"# PROBLEM: {problem_name}")
+    print(f"# Type: {problem_type}")
     print(f"# Backend: {backend}")
     print(f"# Target speedup: >= {target_speedup}x")
     print(f"# Max attempts: {max_attempts}")
@@ -447,57 +557,55 @@ def run_loop(problem_path: str, output_dir: str, max_attempts: int = 3,
     best_speedup = 0.0
     best_code_path = None
     feedback = None
+    all_results = []
     
     for attempt in range(1, max_attempts + 1):
         print(f"\n{'='*60}")
         print(f"ATTEMPT {attempt}/{max_attempts}")
         print(f"{'='*60}")
         
-        # Generate samples
+        # Generate code (1 sample per attempt)
         output_path = str(problem_dir / f"code_{attempt}.py")
-        samples = run_generate(
-            problem_path, output_path, 
-            num_samples=samples_per_attempt,
+        code_path = run_generate(
+            problem_path, output_path,
             feedback=feedback,
             attempt=attempt,
             backend=backend
         )
         
-        if not samples:
-            print(f"No samples generated in attempt {attempt}")
+        if not code_path:
+            print(f"No code generated in attempt {attempt}")
             continue
         
-        # Evaluate each sample
-        results = []
-        for i, sample_path in enumerate(samples):
-            print(f"\n--- Evaluating sample {i+1}: {Path(sample_path).name} ---")
-            result_path = str(problem_dir / f"result_{attempt}_s{i}.json")
+        # Evaluate
+        print(f"\n--- Evaluating: {Path(code_path).name} ---")
+        result_path = str(problem_dir / f"result_{attempt}.json")
+        
+        result = run_evaluate(code_path, problem_path, result_path, backend=backend)
+        result["code_path"] = code_path
+        all_results.append(result)
+        
+        # Print summary
+        compile_ok = "✓" if result.get("compile_success") else "✗"
+        accuracy_ok = "✓" if result.get("accuracy_pass") else "✗"
+        speedup = result.get("speedup", 0)
+        
+        print(f"  Compile: {compile_ok} | Accuracy: {accuracy_ok} | Speedup: {speedup:.2f}x")
+        
+        if result.get("rocprof_metrics", {}).get("optimization_hints"):
+            for hint in result["rocprof_metrics"]["optimization_hints"]:
+                print(f"  Profile: {hint}")
+        
+        # Check if this is the best so far
+        if result.get("accuracy_pass") and speedup > best_speedup:
+            best_speedup = speedup
+            best_result = result
+            best_code_path = code_path
             
-            result = run_evaluate(sample_path, problem_path, result_path, backend=backend)
-            result["sample_path"] = sample_path
-            results.append(result)
-            
-            # Print summary
-            compile_ok = "✓" if result.get("compile_success") else "✗"
-            accuracy_ok = "✓" if result.get("accuracy_pass") else "✗"
-            speedup = result.get("speedup", 0)
-            
-            print(f"  Compile: {compile_ok} | Accuracy: {accuracy_ok} | Speedup: {speedup:.2f}x")
-            
-            if result.get("rocprof_metrics", {}).get("optimization_hints"):
-                for hint in result["rocprof_metrics"]["optimization_hints"]:
-                    print(f"  Profile: {hint}")
-            
-            # Check if this is the best so far
-            if result.get("accuracy_pass") and speedup > best_speedup:
-                best_speedup = speedup
-                best_result = result
-                best_code_path = sample_path
-                
-                # Copy best code
-                shutil.copy(sample_path, problem_dir / "best_code.py")
-                with open(problem_dir / "best_result.json", "w") as f:
-                    json.dump(result, f, indent=2)
+            # Copy best code
+            shutil.copy(code_path, problem_dir / "best_code.py")
+            with open(problem_dir / "best_result.json", "w") as f:
+                json.dump(result, f, indent=2)
         
         # Check if we've achieved target
         if best_speedup >= target_speedup:
@@ -505,9 +613,9 @@ def run_loop(problem_path: str, output_dir: str, max_attempts: int = 3,
             break
         
         # Build feedback for next attempt
-        feedback = build_feedback(results, backend=backend)
+        feedback = build_feedback([result], backend=backend, problem_type=problem_type)
         if feedback:
-            print(f"\n--- Feedback for next attempt ---\n{feedback}")
+            print(f"\n--- Feedback for next attempt ---\n{feedback[:500]}...")
     
     # Final summary
     print(f"\n{'='*70}")
@@ -526,11 +634,13 @@ def run_loop(problem_path: str, output_dir: str, max_attempts: int = 3,
     
     return {
         "problem": problem_name,
+        "problem_type": problem_type,
         "status": status,
         "best_speedup": best_speedup,
         "best_code": best_code_path,
         "best_result": best_result,
         "attempts": attempt,
+        "all_results": all_results,
     }
 
 
@@ -539,10 +649,9 @@ def main():
     parser.add_argument("--problem", required=True, help="Problem file path or comma-separated list")
     parser.add_argument("--output", default="results", help="Output directory")
     parser.add_argument("--max-attempts", type=int, default=3, help="Max attempts per problem")
-    parser.add_argument("--samples", type=int, default=1, help="Samples per attempt (1 for focused iteration)")
-    parser.add_argument("--target-speedup", type=float, default=1.1, help="Target speedup (default 1.1x, achievable with optimized kernel)")
-    parser.add_argument("--backend", choices=BACKENDS, default="hip",
-                        help="Backend type: 'hip' for HipKittens, 'triton' for Triton (default: hip)")
+    parser.add_argument("--target-speedup", type=float, default=1.0, help="Target speedup (default 1.0x)")
+    parser.add_argument("--backend", choices=BACKENDS, default="triton",
+                        help="Backend type: 'hip' for HipKittens, 'triton' for Triton (default: triton)")
     args = parser.parse_args()
     
     # Check LLM key
@@ -569,7 +678,6 @@ def main():
             problem, 
             args.output,
             max_attempts=args.max_attempts,
-            samples_per_attempt=args.samples,
             target_speedup=args.target_speedup,
             backend=args.backend
         )

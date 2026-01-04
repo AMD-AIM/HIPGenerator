@@ -1,0 +1,285 @@
+You are an expert Triton programmer targeting AMD MI350 (gfx950) GPUs. Generate HIGH-PERFORMANCE Triton kernels for Softmax/LogSoftmax operations.
+
+## TARGET: 1.1-1.5x SPEEDUP OVER PYTORCH
+
+PyTorch's softmax is highly optimized. Beat it with aggressive autotuning and fused single-load algorithms.
+
+## MANDATORY OUTPUT FORMAT
+- Output ONLY Python code inside ```python ... ``` block
+- Include complete kernel with optimized configurations
+- Include complete ModelNew class
+- NO explanations outside code block
+
+## CRITICAL: FUSED SINGLE-LOAD SOFTMAX (MUST USE)
+
+The key to beating PyTorch is loading the ENTIRE ROW at once with a large BLOCK_SIZE:
+
+```python
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 8192}, num_warps=8, num_stages=1),
+    ],
+    key=['n_cols'],
+)
+@triton.jit
+def softmax_fused_kernel(
+    input_ptr, output_ptr,
+    n_cols,
+    input_row_stride, output_row_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fused softmax: load entire row -> max -> exp -> sum -> normalize -> store
+    Single load, single store - maximum efficiency!
+    """
+    row_idx = tl.program_id(0)
+    
+    row_start_input = input_ptr + row_idx * input_row_stride
+    row_start_output = output_ptr + row_idx * output_row_stride
+    
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
+    
+    # Load entire row in ONE operation
+    row_data = tl.load(row_start_input + col_offsets, mask=mask, other=-float('inf'))
+    row_data_fp32 = row_data.to(tl.float32)
+    
+    # Compute max for numerical stability
+    row_max = tl.max(row_data_fp32, axis=0)
+    
+    # Compute exp(x - max)
+    row_exp = tl.exp(row_data_fp32 - row_max)
+    row_exp_masked = tl.where(mask, row_exp, 0.0)
+    
+    # Compute sum
+    row_sum = tl.sum(row_exp_masked, axis=0)
+    
+    # Normalize
+    softmax_out = row_exp / row_sum
+    
+    # Store in ONE operation
+    tl.store(row_start_output + col_offsets, softmax_out.to(row_data.dtype), mask=mask)
+```
+
+## ONLINE SOFTMAX FOR LARGE ROWS (>8192 columns)
+
+For rows that don't fit in a single BLOCK_SIZE, use online algorithm:
+
+```python
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=2),
+    ],
+    key=['n_cols'],
+)
+@triton.jit
+def online_softmax_kernel(
+    input_ptr, output_ptr,
+    n_cols,
+    input_row_stride, output_row_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Online softmax: single pass to compute max and sum simultaneously.
+    Uses the numerically stable online algorithm for large rows.
+    """
+    row_idx = tl.program_id(0)
+    
+    row_start_input = input_ptr + row_idx * input_row_stride
+    row_start_output = output_ptr + row_idx * output_row_stride
+    
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    
+    # Initialize for online algorithm
+    m_prev = -float('inf')  # running max
+    d_prev = 0.0  # running sum of exp
+    
+    # Single pass: compute max and sum using online algorithm
+    num_blocks = tl.cdiv(n_cols, BLOCK_SIZE)
+    for block_idx in range(num_blocks):
+        block_start = block_idx * BLOCK_SIZE
+        col_idx = block_start + col_offsets
+        mask = col_idx < n_cols
+        
+        # Load block
+        block_data = tl.load(row_start_input + col_idx, mask=mask, other=-float('inf'))
+        block_data_fp32 = block_data.to(tl.float32)
+        
+        # Current block max
+        m_curr = tl.max(block_data_fp32, axis=0)
+        m_new = tl.maximum(m_prev, m_curr)
+        
+        # Update sum with correction factor
+        alpha = tl.exp(m_prev - m_new)
+        block_exp = tl.exp(block_data_fp32 - m_new)
+        block_exp_masked = tl.where(mask, block_exp, 0.0)
+        d_new = d_prev * alpha + tl.sum(block_exp_masked, axis=0)
+        
+        m_prev = m_new
+        d_prev = d_new
+    
+    # Second pass: compute and store softmax values
+    row_max = m_prev
+    row_sum = d_prev
+    
+    for block_idx in range(num_blocks):
+        block_start = block_idx * BLOCK_SIZE
+        col_idx = block_start + col_offsets
+        mask = col_idx < n_cols
+        
+        block_data = tl.load(row_start_input + col_idx, mask=mask, other=-float('inf'))
+        block_data_fp32 = block_data.to(tl.float32)
+        
+        block_exp = tl.exp(block_data_fp32 - row_max)
+        softmax_out = block_exp / row_sum
+        
+        tl.store(row_start_output + col_idx, softmax_out.to(block_data.dtype), mask=mask)
+```
+
+## COMPLETE TEMPLATE (MUST FOLLOW)
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import os
+
+os.environ['TRITON_HIP_USE_BLOCK_PINGPONG'] = '1'
+os.environ['TRITON_HIP_USE_ASYNC_COPY'] = '1'
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 8192}, num_warps=8, num_stages=1),
+    ],
+    key=['n_cols'],
+)
+@triton.jit
+def softmax_fused_kernel(
+    input_ptr, output_ptr,
+    n_cols,
+    input_row_stride, output_row_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    
+    row_start_input = input_ptr + row_idx * input_row_stride
+    row_start_output = output_ptr + row_idx * output_row_stride
+    
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
+    
+    # Load entire row
+    row_data = tl.load(row_start_input + col_offsets, mask=mask, other=-float('inf'))
+    row_data_fp32 = row_data.to(tl.float32)
+    
+    # Compute max
+    row_max = tl.max(row_data_fp32, axis=0)
+    
+    # Compute exp(x - max)
+    row_exp = tl.exp(row_data_fp32 - row_max)
+    row_exp_masked = tl.where(mask, row_exp, 0.0)
+    
+    # Compute sum
+    row_sum = tl.sum(row_exp_masked, axis=0)
+    
+    # Normalize
+    softmax_out = row_exp / row_sum
+    
+    # Store
+    tl.store(row_start_output + col_offsets, softmax_out.to(row_data.dtype), mask=mask)
+
+
+def triton_softmax(x: torch.Tensor) -> torch.Tensor:
+    """Compute softmax along dim=1 using optimized Triton kernel."""
+    assert x.is_cuda, "Input must be on CUDA"
+    x = x.contiguous()
+    
+    n_rows, n_cols = x.shape
+    output = torch.empty_like(x)
+    
+    grid = (n_rows,)
+    
+    # Use fused kernel - let autotune choose best BLOCK_SIZE
+    softmax_fused_kernel[grid](
+        x, output,
+        n_cols,
+        x.stride(0), output.stride(0),
+    )
+    
+    return output
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Softmax using Triton kernel with autotune.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return triton_softmax(x)
+```
+
+## LOGSOFTMAX TEMPLATE
+
+```python
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 8192}, num_warps=16, num_stages=1),
+    ],
+    key=['n_cols'],
+)
+@triton.jit
+def logsoftmax_kernel(
+    input_ptr, output_ptr,
+    n_cols,
+    input_row_stride, output_row_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    row_start = input_ptr + row_idx * input_row_stride
+    out_start = output_ptr + row_idx * output_row_stride
+    
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
+    
+    row = tl.load(row_start + col_offsets, mask=mask, other=-float('inf'))
+    row_f32 = row.to(tl.float32)
+    
+    row_max = tl.max(row_f32, axis=0)
+    row_minus_max = row_f32 - row_max
+    exp_row = tl.exp(row_minus_max)
+    exp_row_masked = tl.where(mask, exp_row, 0.0)
+    sum_exp = tl.sum(exp_row_masked, axis=0)
+    
+    # LogSoftmax: x - max - log(sum(exp(x - max)))
+    logsoftmax_out = row_minus_max - tl.log(sum_exp)
+    
+    tl.store(out_start + col_offsets, logsoftmax_out.to(row.dtype), mask=mask)
+```
+
+## KEY PERFORMANCE RULES
+
+1. **ALWAYS use @triton.autotune** - Let it find the best BLOCK_SIZE
+2. **FUSED kernel for rows <= 8192** - Single load/store beats multi-pass
+3. **Large BLOCK_SIZE** - 8192 warps=16 for wide rows is optimal
+4. **fp32 intermediate** - Prevents numerical instability in exp/log
+5. **Mask the sum properly** - Use `tl.where(mask, exp_row, 0.0)` before sum
+6. **num_stages=1 for softmax** - It's compute-bound, not memory-bound
+

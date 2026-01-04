@@ -32,47 +32,79 @@ echo "2. Compiling TypeScript..."
 npm run compile
 
 echo ""
-echo "3. Checking for VSCode/Cursor..."
+echo "3. Installing vsce (VSCode packaging tool)..."
+npm install -g @vscode/vsce 2>/dev/null || npm install @vscode/vsce
 
-# Install the extension
-if command -v code &> /dev/null; then
-    echo "   Found 'code' command, installing extension..."
-    code --install-extension "$SCRIPT_DIR" --force 2>/dev/null || true
-elif command -v cursor &> /dev/null; then
-    echo "   Found 'cursor' command, installing extension..."
-    cursor --install-extension "$SCRIPT_DIR" --force 2>/dev/null || true
-else
-    echo "   VSCode/Cursor CLI not found."
-    echo "   To install manually:"
+echo ""
+echo "4. Packaging extension as VSIX..."
+# Clean up old vsix files
+rm -f "$SCRIPT_DIR"/*.vsix
+
+# Package the extension
+npx vsce package --allow-missing-repository
+VSIX_FILE=$(ls "$SCRIPT_DIR"/*.vsix 2>/dev/null | head -1)
+
+if [ -z "$VSIX_FILE" ]; then
+    echo "Error: Failed to create VSIX package"
+    exit 1
+fi
+echo "Created: $VSIX_FILE"
+
+echo ""
+echo "5. Installing extension..."
+
+# Try different CLI tools
+INSTALLED=false
+
+# Try cursor CLI (remote server)
+if [ -f "/root/.cursor-server/bin/"*"/bin/remote-cli/cursor" ]; then
+    CURSOR_CLI=$(ls /root/.cursor-server/bin/*/bin/remote-cli/cursor 2>/dev/null | head -1)
+    if [ -n "$CURSOR_CLI" ]; then
+        echo "   Using Cursor remote CLI: $CURSOR_CLI"
+        "$CURSOR_CLI" --install-extension "$VSIX_FILE" --force && INSTALLED=true
+    fi
+fi
+
+# Try cursor command
+if [ "$INSTALLED" = false ] && command -v cursor &> /dev/null; then
+    echo "   Using cursor command..."
+    cursor --install-extension "$VSIX_FILE" --force && INSTALLED=true
+fi
+
+# Try code command
+if [ "$INSTALLED" = false ] && command -v code &> /dev/null; then
+    echo "   Using code command..."
+    code --install-extension "$VSIX_FILE" --force && INSTALLED=true
+fi
+
+if [ "$INSTALLED" = false ]; then
+    echo ""
+    echo "   ⚠ Could not auto-install. Please install manually:"
     echo "   1. Open VSCode/Cursor"
-    echo "   2. Go to Extensions (Ctrl+Shift+X)"
-    echo "   3. Click '...' -> 'Install from VSIX'"
-    echo "   4. Or run: npm run package && code --install-extension *.vsix"
+    echo "   2. Press Ctrl+Shift+P"
+    echo "   3. Type 'Extensions: Install from VSIX'"
+    echo "   4. Select: $VSIX_FILE"
 fi
 
 echo ""
 echo "================================================"
 echo "Installation complete!"
 echo ""
+echo "VSIX file location: $VSIX_FILE"
+echo ""
 echo "Next steps:"
-echo "1. Reload VSCode/Cursor (Ctrl+Shift+P -> 'Reload Window')"
+echo "1. Reload VSCode/Cursor window:"
+echo "   - Press Ctrl+Shift+P"
+echo "   - Type 'Reload Window' and press Enter"
+echo ""
 echo "2. Configure your AMD API Key:"
 echo "   - Open Settings (Ctrl+,)"
 echo "   - Search for 'HIP Generator'"
-echo "   - Set 'hipGenerator.amdApiKey'"
+echo "   - Set 'hipGenerator.amdApiKey' to your key"
 echo ""
 echo "3. Usage:"
-echo "   - Select PyTorch code in a .py file"
+echo "   - Open a .py file"
+echo "   - Select PyTorch code"
 echo "   - Right-click -> 'Generate Triton Kernel'"
+echo "   - Or Right-click -> 'Optimize Triton Kernel'"
 echo "================================================"
-
-
-
-
-
-
-
-
-
-
-

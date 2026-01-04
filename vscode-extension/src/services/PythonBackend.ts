@@ -834,25 +834,17 @@ export class PythonBackend {
         feedback?: string,
         newClassName?: string
     ): Promise<{ success: boolean; error?: string }> {
-        const generateScript = path.join(hipGeneratorPath, 'generate.py');
+        // Use unified run.py entry point for optimization
+        const runScript = path.join(hipGeneratorPath, 'run.py');
         const args = [
-            generateScript,
-            '--optimize', codeFile,
+            runScript,
+            'optimize',
+            '--problem', codeFile,  // Problem file (contains get_inputs)
+            '--prev-code', codeFile,
             '--output', outputFile,
-            '--backend', 'triton',
-            '--num-samples', '1',
-            '--temperature', temperature.toString()
+            '--speedup', '0.5',  // Will be updated by profiler
+            '--profile'  // Always profile for feedback
         ];
-
-        // Add feedback if available
-        if (feedback) {
-            args.push('--feedback', feedback);
-        }
-
-        // Add new class name if specified
-        if (newClassName) {
-            args.push('--new-class-name', newClassName);
-        }
 
         const result = await this._runPython(pythonPath, args, {
             LLM_GATEWAY_KEY: apiKey,
@@ -946,13 +938,14 @@ export class PythonBackend {
         apiKey: string,
         temperature: number
     ): Promise<{ success: boolean; error?: string }> {
-        const generateScript = path.join(hipGeneratorPath, 'generate.py');
+        // Use unified run.py entry point
+        const runScript = path.join(hipGeneratorPath, 'run.py');
         const args = [
-            generateScript,
+            runScript,
+            'generate',
             '--problem', problemFile,
             '--output', outputFile,
-            '--backend', backend,
-            '--num-samples', '1',
+            '--samples', '1',
             '--temperature', temperature.toString()
         ];
 
@@ -1076,20 +1069,20 @@ export class PythonBackend {
         hipGeneratorPath: string
     ): Promise<EvaluationResult> {
         const codeFile = path.join(this._tempDir, `eval_code_${Date.now()}.py`);
-        const resultFile = path.join(this._tempDir, `result_${Date.now()}.json`);
         
         fs.writeFileSync(codeFile, generatedCode);
 
         this._outputChannel.appendLine(`Evaluating...`);
 
         try {
-            const evalScript = path.join(hipGeneratorPath, 'eval.py');
+            // Use unified run.py entry point for evaluation
+            const runScript = path.join(hipGeneratorPath, 'run.py');
             const args = [
-                evalScript,
-                '--code', codeFile,
+                runScript,
+                'evaluate',
                 '--problem', problemFile,
-                '--output', resultFile,
-                '--backend', backend
+                '--code', codeFile,
+                '--json'
             ];
 
             const config = vscode.workspace.getConfiguration('hipGenerator');
@@ -1100,26 +1093,59 @@ export class PythonBackend {
                 PYTORCH_ROCM_ARCH: 'gfx950'
             });
 
-            if (fs.existsSync(resultFile)) {
+            // Parse JSON from stdout
+            if (result.stdout) {
                 try {
-                    // Read and fix JSON (handle Infinity, NaN, etc.)
-                    let jsonContent = fs.readFileSync(resultFile, 'utf-8');
-                    jsonContent = this._fixJsonSpecialValues(jsonContent);
-                    
-                    const evalResult = JSON.parse(jsonContent);
-                    return evalResult;
+                    // Find JSON object in output
+                    const jsonMatch = result.stdout.match(/\{[\s\S]*\}/);
+                    if (jsonMatch) {
+                        let jsonContent = jsonMatch[0];
+                        jsonContent = this._fixJsonSpecialValues(jsonContent);
+                        const evalResult = JSON.parse(jsonContent);
+                        return {
+                            compile_success: evalResult.compile_success ?? true,
+                            accuracy_pass: evalResult.accuracy_pass ?? false,
+                            max_diff: evalResult.max_diff ?? Infinity,
+                            mean_diff: evalResult.mean_diff ?? Infinity,
+                            has_nan: evalResult.has_nan ?? false,
+                            has_inf: evalResult.has_inf ?? false,
+                            ref_time_ms: evalResult.ref_time_ms ?? 0,
+                            new_time_ms: evalResult.new_time_ms ?? 0,
+                            speedup: evalResult.speedup ?? 0,
+                            error: evalResult.error
+                        };
+                    }
                 } catch (parseError: any) {
                     this._outputChannel.appendLine(`JSON parse error: ${parseError.message}`);
-                    return this._failedEvaluation(`JSON parse error: ${parseError.message}`);
                 }
-            } else {
-                // Try to extract error from stderr
-                const errorMatch = result.stderr?.match(/Error:?\s*(.+)/i);
-                const error = errorMatch ? errorMatch[1] : (result.stderr?.slice(-500) || 'Evaluation failed');
-                return this._failedEvaluation(error);
             }
+            
+            // Fallback: try to extract info from text output
+            const speedupMatch = result.stdout?.match(/Speedup:\s*([\d.]+)x/);
+            const accuracyMatch = result.stdout?.match(/Accuracy:\s*([✓✗])/);
+            const compileMatch = result.stdout?.match(/Compile:\s*([✓✗])/);
+            
+            if (speedupMatch) {
+                return {
+                    compile_success: compileMatch ? compileMatch[1] === '✓' : true,
+                    accuracy_pass: accuracyMatch ? accuracyMatch[1] === '✓' : false,
+                    max_diff: 0,
+                    mean_diff: 0,
+                    has_nan: false,
+                    has_inf: false,
+                    ref_time_ms: 0,
+                    new_time_ms: 0,
+                    speedup: parseFloat(speedupMatch[1]),
+                    error: undefined
+                };
+            }
+            
+            // Try to extract error from stderr
+            const errorMatch = result.stderr?.match(/Error:?\s*(.+)/i);
+            const error = errorMatch ? errorMatch[1] : (result.stderr?.slice(-500) || 'Evaluation failed');
+            return this._failedEvaluation(error);
         } finally {
-            this._cleanup(codeFile, resultFile);
+            this._cleanup(codeFile);
         }
     }
 

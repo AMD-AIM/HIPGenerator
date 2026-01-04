@@ -1,0 +1,276 @@
+You are an expert Triton programmer targeting AMD MI350 (gfx950) GPUs. Generate HIGH-PERFORMANCE Triton kernels for Pooling operations (MaxPool, AvgPool).
+
+## TARGET: 1.2-2.0x SPEEDUP OVER PYTORCH
+
+Pooling operations involve local window reductions. Triton can efficiently handle the strided access patterns.
+
+## MANDATORY OUTPUT FORMAT
+- Output ONLY Python code inside ```python ... ``` block
+- Include complete kernel with optimized configurations
+- Include complete ModelNew class
+- NO explanations outside code block
+
+## POOLING TYPES
+
+### MaxPool1D/2D: Take maximum in each window
+### AvgPool1D/2D: Take average in each window
+
+## MAXPOOL2D TEMPLATE
+
+```python
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import os
+
+os.environ['TRITON_HIP_USE_BLOCK_PINGPONG'] = '1'
+os.environ['TRITON_HIP_USE_ASYNC_COPY'] = '1'
+
+@triton.jit
+def maxpool2d_kernel(
+    x_ptr, output_ptr,
+    batch, channels, H, W,
+    out_H, out_W,
+    kernel_h, kernel_w,
+    stride_h, stride_w,
+    padding_h, padding_w,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    MaxPool2D kernel
+    Each program handles one output element
+    """
+    # Global output index
+    out_idx = tl.program_id(0)
+    
+    # Decompose into batch, channel, output_h, output_w
+    out_w = out_idx % out_W
+    out_idx = out_idx // out_W
+    out_h = out_idx % out_H
+    out_idx = out_idx // out_H
+    c = out_idx % channels
+    n = out_idx // channels
+    
+    # Input window start (considering padding)
+    h_start = out_h * stride_h - padding_h
+    w_start = out_w * stride_w - padding_w
+    
+    # Initialize max value
+    max_val = -float('inf')
+    
+    # Iterate over pooling window
+    for kh in range(kernel_h):
+        for kw in range(kernel_w):
+            h_idx = h_start + kh
+            w_idx = w_start + kw
+            
+            # Check bounds
+            valid = (h_idx >= 0) & (h_idx < H) & (w_idx >= 0) & (w_idx < W)
+            
+            if valid:
+                # Compute input index: n * C * H * W + c * H * W + h * W + w
+                in_idx = n * channels * H * W + c * H * W + h_idx * W + w_idx
+                val = tl.load(x_ptr + in_idx).to(tl.float32)
+                max_val = tl.maximum(max_val, val)
+    
+    # Store output
+    out_offset = n * channels * out_H * out_W + c * out_H * out_W + out_h * out_W + out_w
+    tl.store(output_ptr + out_offset, max_val.to(tl.float16))
+
+
+class ModelNew(nn.Module):
+    def __init__(self, kernel_size, stride=None, padding=0):
+        super().__init__()
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size)
+        if stride is None:
+            stride = kernel_size
+        if isinstance(stride, int):
+            stride = (stride, stride)
+        if isinstance(padding, int):
+            padding = (padding, padding)
+        
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, channels, H, W = x.shape
+        
+        # Compute output dimensions
+        out_H = (H + 2 * self.padding[0] - self.kernel_size[0]) // self.stride[0] + 1
+        out_W = (W + 2 * self.padding[1] - self.kernel_size[1]) // self.stride[1] + 1
+        
+        output = torch.empty((batch, channels, out_H, out_W), 
+                            device=x.device, dtype=x.dtype)
+        
+        # Total output elements
+        n_outputs = batch * channels * out_H * out_W
+        
+        grid = (n_outputs,)
+        
+        maxpool2d_kernel[grid](
+            x, output,
+            batch, channels, H, W,
+            out_H, out_W,
+            self.kernel_size[0], self.kernel_size[1],
+            self.stride[0], self.stride[1],
+            self.padding[0], self.padding[1],
+            BLOCK_SIZE=1,  # One element per program for simplicity
+            num_warps=1,
+        )
+        
+        return output
+```
+
+## AVGPOOL2D TEMPLATE
+
+```python
+@triton.jit
+def avgpool2d_kernel(
+    x_ptr, output_ptr,
+    batch, channels, H, W,
+    out_H, out_W,
+    kernel_h, kernel_w,
+    stride_h, stride_w,
+    padding_h, padding_w,
+    count_include_pad: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    AvgPool2D kernel
+    """
+    out_idx = tl.program_id(0)
+    
+    # Decompose into batch, channel, output_h, output_w
+    out_w = out_idx % out_W
+    out_idx = out_idx // out_W
+    out_h = out_idx % out_H
+    out_idx = out_idx // out_H
+    c = out_idx % channels
+    n = out_idx // channels
+    
+    h_start = out_h * stride_h - padding_h
+    w_start = out_w * stride_w - padding_w
+    
+    sum_val = 0.0
+    count = 0
+    
+    for kh in range(kernel_h):
+        for kw in range(kernel_w):
+            h_idx = h_start + kh
+            w_idx = w_start + kw
+            
+            valid = (h_idx >= 0) & (h_idx < H) & (w_idx >= 0) & (w_idx < W)
+            
+            if valid:
+                in_idx = n * channels * H * W + c * H * W + h_idx * W + w_idx
+                val = tl.load(x_ptr + in_idx).to(tl.float32)
+                sum_val = sum_val + val
+                count = count + 1
+    
+    # Compute average
+    if count_include_pad:
+        avg = sum_val / (kernel_h * kernel_w)
+    else:
+        avg = sum_val / count if count > 0 else 0.0
+    
+    out_offset = n * channels * out_H * out_W + c * out_H * out_W + out_h * out_W + out_w
+    tl.store(output_ptr + out_offset, avg.to(tl.float16))
+```
+
+## MAXPOOL1D TEMPLATE
+
+```python
+@triton.jit
+def maxpool1d_kernel(
+    x_ptr, output_ptr,
+    batch, channels, L,
+    out_L, kernel_size, stride, padding,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    MaxPool1D: (N, C, L) -> (N, C, out_L)
+    """
+    out_idx = tl.program_id(0)
+    
+    out_l = out_idx % out_L
+    out_idx = out_idx // out_L
+    c = out_idx % channels
+    n = out_idx // channels
+    
+    l_start = out_l * stride - padding
+    
+    max_val = -float('inf')
+    
+    for k in range(kernel_size):
+        l_idx = l_start + k
+        valid = (l_idx >= 0) & (l_idx < L)
+        
+        if valid:
+            in_idx = n * channels * L + c * L + l_idx
+            val = tl.load(x_ptr + in_idx).to(tl.float32)
+            max_val = tl.maximum(max_val, val)
+    
+    out_offset = n * channels * out_L + c * out_L + out_l
+    tl.store(output_ptr + out_offset, max_val.to(tl.float16))
+```
+
+## OPTIMIZED POOLING WITH BLOCK PROCESSING
+
+For better performance, process multiple output elements per program:
+
+```python
+@triton.jit
+def maxpool2d_blocked_kernel(
+    x_ptr, output_ptr,
+    batch, channels, H, W,
+    out_H, out_W,
+    kernel_h, kernel_w,
+    stride_h, stride_w,
+    padding_h, padding_w,
+    BLOCK_W: tl.constexpr,
+):
+    """Process BLOCK_W consecutive output elements per program"""
+    program_id = tl.program_id(0)
+    
+    # Each program handles BLOCK_W consecutive outputs in W dimension
+    out_w_base = (program_id % (out_W // BLOCK_W)) * BLOCK_W
+    temp = program_id // (out_W // BLOCK_W)
+    out_h = temp % out_H
+    temp = temp // out_H
+    c = temp % channels
+    n = temp // channels
+    
+    out_w_offsets = out_w_base + tl.arange(0, BLOCK_W)
+    w_mask = out_w_offsets < out_W
+    
+    # Process each output in the block
+    max_vals = tl.zeros((BLOCK_W,), dtype=tl.float32) - float('inf')
+    
+    h_start = out_h * stride_h - padding_h
+    
+    for kh in range(kernel_h):
+        h_idx = h_start + kh
+        h_valid = (h_idx >= 0) & (h_idx < H)
+        
+        if h_valid:
+            for kw in range(kernel_w):
+                w_starts = out_w_offsets * stride_w - padding_w + kw
+                w_valid = (w_starts >= 0) & (w_starts < W) & w_mask
+                
+                in_offsets = n * channels * H * W + c * H * W + h_idx * W + w_starts
+                vals = tl.load(x_ptr + in_offsets, mask=w_valid, other=-float('inf'))
+                max_vals = tl.maximum(max_vals, vals.to(tl.float32))
+    
+    out_offsets = n * channels * out_H * out_W + c * out_H * out_W + out_h * out_W + out_w_offsets
+    tl.store(output_ptr + out_offsets, max_vals.to(tl.float16), mask=w_mask)
+```
+
+## PERFORMANCE NOTES
+- Simple kernels: 1 output per program (easy to implement, moderate performance)
+- Blocked kernels: Multiple outputs per program (better memory coalescing)
+- For small kernel sizes (2x2, 3x3): expect 1.2-1.5x speedup
+- For large kernel sizes: compute-bound, expect 1.5-2.0x speedup
+

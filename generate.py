@@ -19,9 +19,61 @@ from anthropic import Anthropic
 BACKENDS = ["hip", "triton"]
 
 
-def classify_problem(problem_name: str, problem_code: str) -> str:
-    """Classify problem type based on name and code."""
+def classify_problem(problem_name: str, problem_code: str, use_llm: bool = False) -> str:
+    """
+    Classify problem type based on name and code.
+    
+    Args:
+        problem_name: Name of the problem
+        problem_code: Source code of the problem
+        use_llm: If True, use LLM for classification (requires LLM_GATEWAY_KEY)
+        
+    Returns:
+        Problem type string
+    """
+    # Try LLM classification if enabled
+    if use_llm:
+        try:
+            from tools.classify_problem import classify_with_llm
+            problem_type, reason = classify_with_llm(problem_code, problem_name)
+            print(f"LLM classified as: {problem_type} ({reason})")
+            return problem_type
+        except Exception as e:
+            print(f"LLM classification failed: {e}, using pattern matching")
+    
+    # Pattern-based classification (fallback or default)
     name_lower = problem_name.lower()
+    code_lower = problem_code.lower()
+    
+    # Activation / Element-wise operations
+    elementwise_patterns = ["relu", "gelu", "swish", "silu", "sigmoid", "tanh", "leaky", "elu", "selu", "mish", "hardswish", "hardsigmoid"]
+    for pattern in elementwise_patterns:
+        if pattern in name_lower:
+            return "elementwise"
+    
+    # Softmax variants
+    if "softmax" in name_lower or "logsoftmax" in name_lower:
+        return "softmax"
+    
+    # Normalization operations
+    norm_patterns = ["layernorm", "batchnorm", "rmsnorm", "groupnorm", "instancenorm", "_norm_", "normalization"]
+    for pattern in norm_patterns:
+        if pattern in name_lower:
+            return "norm"
+    
+    # Pooling operations
+    if "pool" in name_lower:
+        return "pooling"
+    
+    # Reduction operations
+    reduction_patterns = ["sum_reduction", "mean_reduction", "max_reduction", "min_reduction", "reduce"]
+    for pattern in reduction_patterns:
+        if pattern in name_lower:
+            return "reduction"
+    
+    # Attention mechanisms
+    if "attention" in name_lower or "multihead" in name_lower:
+        return "attention"
     
     # Matrix-Vector: has N=1 or (K, 1) shape
     if "matrix_vector" in name_lower or "matvec" in name_lower or "mv_" in name_lower:
@@ -33,7 +85,7 @@ def classify_problem(problem_name: str, problem_code: str) -> str:
     
     # 2D GEMM patterns
     gemm_2d_patterns = [
-        r"square.*matrix", r"standard.*matrix", r"gemm", r"mm_"
+        r"square.*matrix", r"standard.*matrix", r"gemm", r"mm_", r"matmul"
     ]
     if any(re.search(p, name_lower) for p in gemm_2d_patterns):
         return "gemm_2d"
@@ -41,6 +93,16 @@ def classify_problem(problem_name: str, problem_code: str) -> str:
     # Fallback: check if it's a matmul-like operation
     if "matrix" in name_lower and "mult" in name_lower:
         return "gemm_2d"
+    
+    # Check code content for clues
+    if "torch.mm(" in code_lower or "torch.matmul(" in code_lower or "@" in problem_code:
+        return "gemm_2d"
+    if any(f"torch.{op}" in code_lower for op in ["sigmoid", "relu", "gelu", "tanh", "exp", "log"]):
+        return "elementwise"
+    if "torch.softmax" in code_lower or "F.softmax" in code_lower:
+        return "softmax"
+    if any(norm in code_lower for norm in ["layer_norm", "batch_norm", "rms", "group_norm"]):
+        return "norm"
     
     return "unknown"
 
@@ -616,8 +678,41 @@ Generate the corrected kernel code:"""
     return reflection_prompt
 
 
-def build_optimization_prompt(original_prompt: str, ref_code: str, custom_kernel: str, speedup: float, retry_count: int) -> str:
+def parse_profiler_feedback(profiler_feedback: str) -> dict:
+    """Parse profiler feedback string into structured metrics."""
+    metrics = {}
+    if not profiler_feedback:
+        return metrics
+    
+    import re
+    
+    # Extract L2 hit rate
+    l2_match = re.search(r'L2.*?(\d+\.?\d*)%', profiler_feedback, re.IGNORECASE)
+    if l2_match:
+        metrics['l2_hit_rate'] = float(l2_match.group(1))
+    
+    # Extract VGPR
+    vgpr_match = re.search(r'VGPR.*?(\d+)', profiler_feedback, re.IGNORECASE)
+    if vgpr_match:
+        metrics['vgpr'] = int(vgpr_match.group(1))
+    
+    # Extract workgroup size
+    wg_match = re.search(r'Workgroup.*?(\d+)\s*threads', profiler_feedback, re.IGNORECASE)
+    if wg_match:
+        metrics['workgroup_size'] = int(wg_match.group(1))
+    
+    # Extract LDS
+    lds_match = re.search(r'LDS.*?(\d+\.?\d*)\s*KB', profiler_feedback, re.IGNORECASE)
+    if lds_match:
+        metrics['lds_kb'] = float(lds_match.group(1))
+    
+    return metrics
+
+
+def build_optimization_prompt(original_prompt: str, ref_code: str, custom_kernel: str, speedup: float, retry_count: int, profiler_feedback: str = None) -> str:
     """Construct an optimization prompt when the generated kernel is slower than reference.
+    
+    Uses profiler metrics to give SPECIFIC, ACTIONABLE optimization guidance.
     
     Args:
         original_prompt: The original prompt used for generation
@@ -625,10 +720,14 @@ def build_optimization_prompt(original_prompt: str, ref_code: str, custom_kernel
         custom_kernel: The generated kernel code that is correct but slow
         speedup: The speedup ratio (< 1.0 means slower than reference)
         retry_count: Current retry attempt number
+        profiler_feedback: Feedback from rocprofv3 analysis (VGPR, L2 hit rate, etc.)
     
     Returns:
         A new prompt that asks LLM to optimize the kernel for better performance
     """
+    # Parse profiler metrics
+    metrics = parse_profiler_feedback(profiler_feedback)
+    
     # Detect if this is an element-wise operation
     is_elementwise = any(op in ref_code.lower() for op in [
         'sigmoid', 'relu', 'gelu', 'tanh', 'swish', 'silu', 'softplus',
@@ -640,42 +739,93 @@ def build_optimization_prompt(original_prompt: str, ref_code: str, custom_kernel
     ])
     
     if is_elementwise and not is_gemm:
-        optimization_hints = """
-For element-wise Triton kernels (activation functions, etc.) on AMD MI350:
+        # Build SPECIFIC optimization hints based on profiler metrics
+        specific_hints = []
+        
+        l2_rate = metrics.get('l2_hit_rate', -1)
+        vgpr = metrics.get('vgpr', -1)
+        wg_size = metrics.get('workgroup_size', -1)
+        
+        if l2_rate >= 0 and l2_rate < 50:
+            specific_hints.append(f"""
+**CRITICAL ISSUE: Low L2 Cache Hit Rate ({l2_rate:.1f}%)**
+This indicates poor memory access patterns. For element-wise ops, this often means:
+1. Too many kernel launches (launch overhead > actual computation)
+2. Data not being reused across operations
 
-**CRITICAL: Do NOT use internal loops for element-wise operations!**
-This is a common mistake that destroys performance.
-
-**WRONG (EXTREMELY SLOW)**:
+**REQUIRED FIX - KERNEL FUSION:**
+Instead of separate kernels for each operation, FUSE multiple operations into ONE kernel.
+Example: If the model does x -> activation -> another_op, fuse them:
 ```python
-for i in range(0, BLOCK_SIZE, 8):  # Don't do this!
-    offsets = block_start + i + tl.arange(0, 8)
+@triton.jit
+def fused_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
+    # Load once, do ALL operations, store once
     x = tl.load(x_ptr + offsets, mask=mask)
+    x = first_op(x)    # e.g., sigmoid
+    x = second_op(x)   # e.g., multiply
+    tl.store(out_ptr + offsets, x, mask=mask)
+```
+""")
+        
+        if wg_size > 0 and wg_size < 256:
+            specific_hints.append(f"""
+**ISSUE: Small Workgroup Size ({wg_size} threads)**
+This means poor GPU occupancy. Use BLOCK_SIZE >= 1024 and num_warps >= 4.
+""")
+        
+        if vgpr > 0 and vgpr > 128:
+            specific_hints.append(f"""
+**ISSUE: High VGPR Usage ({vgpr})**
+This limits occupancy. Simplify the kernel or split into smaller operations.
+""")
+        
+        specific_hints_str = "\n".join(specific_hints) if specific_hints else ""
+        
+        optimization_hints = f"""
+{specific_hints_str}
+
+**Element-wise Kernel Optimization Guide:**
+
+1. **KERNEL FUSION is the KEY optimization** for element-wise ops:
+   - Current kernel launches have overhead
+   - Fuse multiple operations into single kernel when possible
+   - Example: fuse activation + scaling, or fuse multiple activations
+
+2. **Use persistent kernel pattern** to reduce launch overhead:
+```python
+@triton.jit
+def persistent_kernel(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    # Each program processes multiple blocks
+    pid = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+    
+    for block_start in range(pid * BLOCK_SIZE, n_elements, num_programs * BLOCK_SIZE):
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = tl.load(x_ptr + offsets, mask=mask)
+        y = compute(x)
+        tl.store(out_ptr + offsets, y, mask=mask)
 ```
 
-**CORRECT (FAST)**:
+3. **Optimize ModelNew.__init__ and forward**:
 ```python
-# Process entire block at once - no internal loop!
-offsets = block_start + tl.arange(0, BLOCK_SIZE)
-mask = offsets < n_elements
-x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-y = operation(x)  # Apply operation
-tl.store(output_ptr + offsets, y, mask=mask)
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Preallocate output to avoid allocation overhead
+        self.register_buffer('_output', None)
+    
+    def forward(self, x):
+        if self._output is None or self._output.shape != x.shape:
+            self._output = torch.empty_like(x)
+        # ... kernel call
+        return self._output
 ```
 
-**Element-wise optimization strategies:**
-1. Use larger BLOCK_SIZE (1024-2048) for better memory throughput
-2. Use float32 for computation, convert back for storage
-3. Precompute grid size in __init__ to reduce launch overhead
-4. Use preallocated output buffer if input size is fixed
-5. Do NOT use XCD swizzle - it's only for GEMM operations!
-6. Ensure coalesced memory access (sequential threads access sequential memory)
-
-**Enable MI350 optimizations:**
-```python
-os.environ['TRITON_HIP_USE_BLOCK_PINGPONG'] = '1'
-os.environ['TRITON_HIP_USE_ASYNC_COPY'] = '1'
-```"""
+**CRITICAL RULES:**
+- Do NOT use tl.tanh() on AMD. Use: `x * (27 + x*x) / (27 + 9*x*x)`
+- When using @triton.autotune, grid must be lambda: `grid = lambda meta: (...,)`
+- Use FP32 for math, FP16 for storage"""
     else:
         optimization_hints = """
 For Triton kernels on AMD MI350 (gfx950), apply these optimization strategies:
@@ -739,6 +889,16 @@ os.environ['TRITON_HIP_USE_ASYNC_COPY'] = '1'
 
 7. **Vectorized Memory Access**: Use appropriate vector widths for bf16/fp16."""
 
+    # Build profiler section if available
+    profiler_section = ""
+    if profiler_feedback:
+        profiler_section = f"""
+PROFILER ANALYSIS (from rocprofv3):
+{profiler_feedback}
+
+Based on the profiler data above, focus on fixing the identified bottlenecks.
+"""
+
     optimization_prompt = f"""The previous kernel generation was CORRECT but too SLOW (speedup: {speedup:.3f}x, meaning it's {1/speedup:.2f}x slower than reference). 
 We need to optimize it for better performance.
 
@@ -758,14 +918,15 @@ CURRENT GENERATED KERNEL (Attempt #{retry_count}, Correct but Slow):
 PERFORMANCE ISSUE:
 The kernel is functionally correct but achieves only {speedup:.3f}x speedup (current runtime is {1/speedup:.2f}x SLOWER than reference).
 We need speedup > 1.0x to be faster than the reference implementation.
-
+{profiler_section}
 {optimization_hints}
 
 Please analyze the performance bottleneck and generate an OPTIMIZED version that:
 1. Maintains correctness (passes all tests)
 2. Achieves speedup > 1.0x (faster than reference)
-3. Implements the optimization strategies mentioned above
-4. Uses hardware-specific optimizations for AMD MI350
+3. Addresses the specific issues identified by the profiler (if available)
+4. Implements the optimization strategies mentioned above
+5. Uses hardware-specific optimizations for AMD MI350
 
 You MUST guarantee the correctness of ModelNew. Do NOT cheat by simplifying logic or skipping computations. Do NOT directly and totally use PyTorch native operators to implement the forward function.
 
@@ -1014,6 +1175,7 @@ def main():
     parser.add_argument("--error-msg", default=None, help="Error message from previous attempt (for reflection)")
     parser.add_argument("--speedup", type=float, default=None, help="Previous speedup value (for optimization)")
     parser.add_argument("--attempt", type=int, default=1, help="Current attempt number")
+    parser.add_argument("--profiler-feedback", default=None, help="Profiler feedback from rocprofv3 analysis (for optimization)")
     args = parser.parse_args()
     
     # Validate arguments
@@ -1070,9 +1232,12 @@ def main():
             # Load optimization system prompt
             system_prompt = load_optimize_prompt()
             
-            # Build optimization prompt
+            # Build optimization prompt with profiler feedback if available
             original_prompt = f"Generate a Triton kernel for the following PyTorch code:\n```python\n{problem_code}\n```"
-            user_prompt = build_optimization_prompt(original_prompt, ref_code, prev_code, speedup, args.attempt)
+            user_prompt = build_optimization_prompt(
+                original_prompt, ref_code, prev_code, speedup, args.attempt,
+                profiler_feedback=args.profiler_feedback
+            )
         
         # Ensure output directory exists
         output_dir = os.path.dirname(os.path.abspath(args.output))

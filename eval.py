@@ -312,9 +312,15 @@ def detect_cheating(code_path: str, backend: str = "triton") -> dict:
     return result
 
 
-def benchmark(fn, warmup=10, iterations=100):
-    """Benchmark a function."""
+def benchmark(fn, warmup=30, iterations=100):
+    """Benchmark a function with extended warmup for autotune stability."""
+    # Extended warmup to let autotune settle
     for _ in range(warmup):
+        _ = fn()
+    torch.cuda.synchronize()
+    
+    # Additional warmup after autotune
+    for _ in range(10):
         _ = fn()
     torch.cuda.synchronize()
     
@@ -328,7 +334,13 @@ def benchmark(fn, warmup=10, iterations=100):
 
 
 def run_rocprof_analysis(code_path: str, problem_path: str, backend: str = "hip") -> dict:
-    """Run rocprofv3 to get detailed kernel performance metrics for GEMM optimization."""
+    """Run rocprofv3 to get detailed kernel performance metrics with PMC counters.
+    
+    Collects:
+    - Per-kernel PMC counters (VALU, SALU, LDS conflicts, L2 hit/miss)
+    - Resource usage (VGPR, SGPR, LDS)
+    - Grid/workgroup configuration
+    """
     perf_info = {
         "kernel_name": None,
         "duration_us": 0.0,
@@ -336,23 +348,28 @@ def run_rocprof_analysis(code_path: str, problem_path: str, backend: str = "hip"
         "total_calls": 0,
         "avg_duration_us": 0.0,
         "percentage": 0.0,
-        # Memory metrics
+        # Resource usage
+        "vgpr_count": 0,
+        "sgpr_count": 0,
         "lds_usage_bytes": 0,
-        "private_segment_size": 0,
-        "group_segment_size": 0,
         # Grid/block config
         "grid_size": [],
         "workgroup_size": [],
+        # PMC counters
+        "pmc_counters": {},
         # Raw metrics for analysis
         "raw_metrics": {},
         "analysis": "",
         "optimization_hints": []
     }
     
+    # Essential PMC counters
+    pmc_counters = "SQ_WAVES,SQ_INSTS_VALU,SQ_INSTS_SALU,SQ_LDS_BANK_CONFLICT,TCC_HIT,TCC_MISS"
+    
     try:
         import sqlite3
         
-        # Create profiling script - use importlib for Triton
+        # Create profiling script
         if backend == "triton":
             profile_code = f'''
 import os
@@ -365,7 +382,7 @@ import importlib.util
 # Load problem
 exec(open("{problem_path}").read())
 
-# Load Triton code via importlib (required for @triton.jit)
+# Load Triton code via importlib
 spec = importlib.util.spec_from_file_location("triton_module", "{code_path}")
 triton_module = importlib.util.module_from_spec(spec)
 sys.modules["triton_module"] = triton_module
@@ -379,14 +396,11 @@ model = ModelNew(*init_inputs).cuda() if init_inputs else ModelNew().cuda()
 inputs = get_inputs()
 inputs = [x.cuda() if isinstance(x, torch.Tensor) else x for x in inputs]
 
-# Warmup and profile
 with torch.no_grad():
     for _ in range(5):
         _ = model(*inputs)
     torch.cuda.synchronize()
-    
-    # Profile runs
-    for _ in range(20):
+    for _ in range(10):
         _ = model(*inputs)
     torch.cuda.synchronize()
 '''
@@ -417,14 +431,13 @@ with torch.no_grad():
             f.write(profile_code)
             profile_script = f.name
         
-        # Output database path
         db_path = tempfile.mktemp(suffix='_results.db')
         output_prefix = db_path.replace('_results.db', '')
         
-        # Run rocprofv3 with kernel trace
+        # Run rocprofv3 with PMC counters and kernel trace
         cmd = [
             'rocprofv3',
-            '--hip-trace',
+            '--pmc', pmc_counters,
             '--kernel-trace', 
             '-o', output_prefix,
             '--',
@@ -435,7 +448,7 @@ with torch.no_grad():
             cmd,
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=120,
             env=os.environ
         )
         
@@ -444,114 +457,130 @@ with torch.no_grad():
             conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
             
-            # Query kernel_summary for stats
-            try:
-                cursor.execute("SELECT * FROM kernel_summary")
-                rows = cursor.fetchall()
-                
-                # Skip PyTorch internal kernels
-                pytorch_internal = ['elementwise', 'at::native', 'c10::', 'vectorized', 'copy', 'fill_', 'zero_']
-                # Look for our kernel (Triton kernels often have 'matmul', 'kernel', or the function name)
-                target_patterns = ['matmul', 'gemm', 'mfma', 'kernel', 'triton']
-                
-                for row in rows:
-                    kernel_name = row[0] if row else ""
-                    is_internal = any(pat in kernel_name for pat in pytorch_internal)
-                    is_target = any(pat in kernel_name.lower() for pat in target_patterns)
-                    
-                    if not is_internal and is_target:
-                        # kernel_summary columns: name, calls, DURATION(nsec), SQR(nsec), AVERAGE(nsec), PERCENT, MIN(nsec), MAX(nsec), VARIANCE, STD_DEV
-                        # Note: All time units are nanoseconds!
-                        perf_info["kernel_name"] = kernel_name[:100]
-                        perf_info["total_calls"] = int(row[1]) if len(row) > 1 else 0
-                        duration_ns = float(row[2]) if len(row) > 2 else 0
-                        perf_info["duration_us"] = duration_ns / 1000.0  # Convert ns to us
-                        perf_info["duration_ms"] = duration_ns / 1e6     # Convert ns to ms
-                        avg_ns = float(row[4]) if len(row) > 4 else 0
-                        perf_info["avg_duration_us"] = avg_ns / 1000.0   # Convert ns to us
-                        perf_info["percentage"] = float(row[5]) if len(row) > 5 else 0
-                        
-                        min_ns = float(row[6]) if len(row) > 6 else 0
-                        max_ns = float(row[7]) if len(row) > 7 else 0
-                        perf_info["raw_metrics"]["min_us"] = min_ns / 1000.0
-                        perf_info["raw_metrics"]["max_us"] = max_ns / 1000.0
-                        perf_info["raw_metrics"]["stddev_us"] = float(row[9]) / 1000.0 if len(row) > 9 and row[9] else 0
-                        break
-            except Exception as e:
-                perf_info["raw_metrics"]["query_error"] = str(e)
-            
-            # Query kernel dispatch for grid/block sizes and LDS usage
+            # Query counters_collection for detailed metrics
             try:
                 cursor.execute("""
-                    SELECT group_segment_size, private_segment_size, 
-                           workgroup_size_x, workgroup_size_y, workgroup_size_z,
-                           grid_size_x, grid_size_y, grid_size_z
-                    FROM rocpd_kernel_dispatch 
-                    LIMIT 10
+                    SELECT 
+                        kernel_name, counter_name, SUM(value) as total,
+                        MAX(vgpr_count), MAX(sgpr_count), MAX(lds_block_size),
+                        MAX(workgroup_size), MAX(grid_size), AVG(duration)
+                    FROM counters_collection
+                    WHERE kernel_name NOT LIKE '%at::native%'
+                      AND kernel_name NOT LIKE '%distribution%'
+                      AND kernel_name NOT LIKE '%elementwise_kernel%'
+                    GROUP BY kernel_name, counter_name
                 """)
-                dispatch_rows = cursor.fetchall()
+                rows = cursor.fetchall()
                 
-                # Find our kernel's dispatch (typically has non-zero group_segment_size for GEMM)
-                for drow in dispatch_rows:
-                    if drow[0] > 0:  # group_segment_size > 0 indicates our kernel
-                        perf_info["group_segment_size"] = drow[0]
-                        perf_info["private_segment_size"] = drow[1]
-                        perf_info["workgroup_size"] = [drow[2], drow[3], drow[4]]
-                        perf_info["grid_size"] = [drow[5], drow[6], drow[7]]
-                        perf_info["lds_usage_bytes"] = drow[0]
-                        break
-                        
+                kernel_counters = {}
+                for row in rows:
+                    kernel_name = row[0]
+                    counter_name = row[1]
+                    
+                    if kernel_name not in kernel_counters:
+                        kernel_counters[kernel_name] = {
+                            "vgpr": row[3] or 0,
+                            "sgpr": row[4] or 0,
+                            "lds_bytes": row[5] or 0,
+                            "workgroup_size": row[6] or 0,
+                            "grid_size": row[7] or 0,
+                            "avg_duration_ns": row[8] or 0,
+                            "counters": {}
+                        }
+                    
+                    kernel_counters[kernel_name]["counters"][counter_name] = row[2] or 0
+                
+                # Find our Triton kernel (not PyTorch internals)
+                for kname, kdata in kernel_counters.items():
+                    perf_info["kernel_name"] = kname[:80]
+                    perf_info["vgpr_count"] = kdata["vgpr"]
+                    perf_info["sgpr_count"] = kdata["sgpr"]
+                    perf_info["lds_usage_bytes"] = kdata["lds_bytes"]
+                    perf_info["workgroup_size"] = [kdata["workgroup_size"], 1, 1]
+                    perf_info["grid_size"] = [kdata["grid_size"], 1, 1]
+                    perf_info["avg_duration_us"] = kdata["avg_duration_ns"] / 1000.0
+                    perf_info["pmc_counters"] = kdata["counters"]
+                    break
+                    
             except Exception as e:
-                perf_info["raw_metrics"]["dispatch_error"] = str(e)
+                perf_info["raw_metrics"]["pmc_error"] = str(e)
+            
+            # Also query kernel_summary for timing stats
+            try:
+                cursor.execute("""
+                    SELECT name, calls, "DURATION(nsec)", "AVERAGE(nsec)", "PERCENT"
+                    FROM kernel_summary
+                    WHERE name NOT LIKE '%at::native%'
+                    LIMIT 5
+                """)
+                summary_rows = cursor.fetchall()
+                
+                for row in summary_rows:
+                    if row[0] == perf_info.get("kernel_name"):
+                        perf_info["total_calls"] = row[1] or 0
+                        perf_info["duration_us"] = (row[2] or 0) / 1000.0
+                        perf_info["percentage"] = row[4] or 0
+                        break
+            except:
+                pass
             
             conn.close()
         
-        # Generate optimization hints
+        # Generate optimization hints from PMC counters
         hints = []
+        counters = perf_info.get("pmc_counters", {})
         
-        # Check LDS usage
-        lds_bytes = perf_info.get("lds_usage_bytes", 0)
-        if lds_bytes > 0:
-            lds_kb = lds_bytes / 1024
-            if lds_kb > 48:  # Using more than 48KB might limit occupancy
-                hints.append(f"HIGH LDS USAGE ({lds_kb:.1f}KB): May limit occupancy, consider smaller tiles")
-            perf_info["raw_metrics"]["lds_kb"] = lds_kb
+        # Check L2 cache hit rate
+        tcc_hit = counters.get("TCC_HIT", 0)
+        tcc_miss = counters.get("TCC_MISS", 0)
+        tcc_total = tcc_hit + tcc_miss
+        if tcc_total > 0:
+            l2_hit_rate = tcc_hit / tcc_total * 100
+            perf_info["raw_metrics"]["l2_hit_rate"] = l2_hit_rate
+            if l2_hit_rate < 50:
+                hints.append(f"LOW L2 HIT RATE ({l2_hit_rate:.1f}%): Consider tile grouping for better cache reuse")
+        
+        # Check LDS bank conflicts
+        lds_conflicts = counters.get("SQ_LDS_BANK_CONFLICT", 0)
+        waves = counters.get("SQ_WAVES", 0)
+        if waves > 0 and lds_conflicts / waves > 1:
+            hints.append(f"LDS BANK CONFLICTS ({lds_conflicts/waves:.1f}/wave): Optimize LDS access pattern")
+        
+        # Check VGPR usage
+        vgpr = perf_info.get("vgpr_count", 0)
+        if vgpr > 128:
+            hints.append(f"HIGH VGPR ({vgpr}): May limit occupancy, reduce register pressure")
         
         # Check workgroup size
-        wg_size = perf_info.get("workgroup_size", [0, 0, 0])
-        total_threads = wg_size[0] * wg_size[1] * wg_size[2] if wg_size else 0
-        if total_threads > 0 and total_threads < 256:
-            hints.append(f"SMALL WORKGROUP ({total_threads} threads): Consider larger blocks for better occupancy")
+        wg_size = perf_info.get("workgroup_size", [0])[0]
+        if wg_size > 0 and wg_size < 256:
+            hints.append(f"SMALL WORKGROUP ({wg_size}): Consider larger blocks")
         
-        # Check kernel percentage
+        # Check instruction mix
+        valu = counters.get("SQ_INSTS_VALU", 0)
+        salu = counters.get("SQ_INSTS_SALU", 0)
+        if salu > valu * 2:
+            hints.append(f"HIGH SALU/VALU RATIO ({salu/valu:.1f}x): Too much scalar work")
+        
+        # Check kernel time percentage
         if perf_info["percentage"] < 80:
             hints.append(f"KERNEL ONLY {perf_info['percentage']:.1f}% of time: Check for host-side overhead")
-        
-        # Check variance
-        min_us = perf_info["raw_metrics"].get("min_us", 0)
-        max_us = perf_info["raw_metrics"].get("max_us", 0)
-        if min_us > 0 and max_us / min_us > 1.5:
-            hints.append(f"HIGH VARIANCE (min={min_us:.1f}us, max={max_us:.1f}us): Possible load imbalance")
         
         perf_info["optimization_hints"] = hints
         
         # Build analysis summary
         analysis_parts = []
         if perf_info["kernel_name"]:
-            # Truncate kernel name for display
-            name_short = perf_info["kernel_name"].split('(')[0][:40]
+            name_short = perf_info["kernel_name"].split('(')[0][:30]
             analysis_parts.append(f"Kernel: {name_short}")
         if perf_info["avg_duration_us"] > 0:
             analysis_parts.append(f"Avg: {perf_info['avg_duration_us']:.1f}us")
-        if perf_info["percentage"] > 0:
-            analysis_parts.append(f"GPU%: {perf_info['percentage']:.1f}%")
+        if perf_info["vgpr_count"] > 0:
+            analysis_parts.append(f"VGPR: {perf_info['vgpr_count']}")
         if perf_info["lds_usage_bytes"] > 0:
             analysis_parts.append(f"LDS: {perf_info['lds_usage_bytes']/1024:.1f}KB")
-        if perf_info["workgroup_size"]:
-            wg = perf_info["workgroup_size"]
-            analysis_parts.append(f"Block: {wg[0]}x{wg[1]}x{wg[2]}")
-        if hints:
-            analysis_parts.append(f"Hints: {'; '.join(hints[:2])}")
+        if "l2_hit_rate" in perf_info["raw_metrics"]:
+            analysis_parts.append(f"L2: {perf_info['raw_metrics']['l2_hit_rate']:.1f}%")
         
         perf_info["analysis"] = " | ".join(analysis_parts) if analysis_parts else "Metrics collected"
         
